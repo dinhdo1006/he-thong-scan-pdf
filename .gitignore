@@ -1,0 +1,79 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+.eggs/
+dist/
+build/
+pip-wheel-metadata/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- Testing / coverage ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# --- IDE / editor ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# --- Project outputs (do not push scan results) ---
+output/
+outputs/
+*.xlsx
+!requirements.txt
+output_tables.xlsx
+output_text.txt
+output_markdown.md
+*.md.bak
+
+# Keep source markdown docs
+!README.md
+
+# --- Local PDF samples (often large / sensitive) ---
+*.pdf
+!docs/**/*.pdf
+
+# --- Marker / ML caches & models (large, download on server) ---
+.cache/
+**/torch_cache/
+**/huggingface/
+~/.cache/
+models/
+*.pt
+*.pth
+*.onnx
+*.bin
+*.safetensors
+
+# --- Env / secrets ---
+.env
+.env.*
+!.env.example
+*.pem
+credentials.json
+secrets.json
+
+# --- Logs / temp ---
+*.log
+tmp/
+temp/
+.tmp/

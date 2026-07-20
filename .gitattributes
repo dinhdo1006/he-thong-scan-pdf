@@ -1,0 +1,23 @@
+# Normalize line endings for cross-platform (Windows <-> Linux server)
+* text=auto eol=lf
+
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.toml text eol=lf
+
+# Binary
+*.pdf binary
+*.xlsx binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.pt binary
+*.pth binary
+*.onnx binary
+*.bin binary
+*.safetensors binary
