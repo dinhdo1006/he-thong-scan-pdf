@@ -1,3 +1,21 @@
 marker-pdf>=1.10.0
 pandas>=2.0.0
 openpyxl>=3.1.0
+PyMuPDF>=1.24.0
+pdfplumber>=0.11.0
+Pillow>=10.0.0
+lxml>=5.0.0
+
+# --- Local Vision-Language Model (VLM) table extraction (pdf_extractor/vlm_extractor.py) ---
+# Requires a CUDA-equipped GPU server. Install a torch build matching your
+# CUDA version -- see https://pytorch.org/get-started/locally/
+torch>=2.2.0
+transformers>=4.45.0
+accelerate>=0.33.0
+qwen-vl-utils>=0.0.8
+
+# --- Optional: PaddleOCR PP-Structure pipeline (pdf_extractor/paddle_extractor.py) ---
+# No longer wired into router.py by default, but kept installable for
+# standalone use.
+# paddlepaddle>=2.6.0
+# paddleocr>=2.7.0
