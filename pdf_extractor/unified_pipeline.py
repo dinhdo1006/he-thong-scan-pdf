@@ -198,17 +198,26 @@ class UnifiedPDFPipeline:
         save_markdown: bool = True,
         text_filename: str = DEFAULT_TEXT_FILENAME,
         tables_filename: str = DEFAULT_TABLES_FILENAME,
+        skip_tables: bool = False,
     ) -> UnifiedResult:
         """
         Process one PDF end-to-end and write outputs into `output_dir`.
 
         Args:
             pdf_path: Input PDF path.
-            output_dir: Directory for output files (created if missing).
+            output_dir: Directory for output files (created if missing). Must
+                be a directory, NOT a `.xlsx`/file path -- if a file with that
+                exact name already exists, a clear `NotADirectoryError` is
+                raised instead of the confusing raw `[Errno 17] File exists`.
             save_markdown: Also write the intermediate Markdown file.
             text_filename: Plain text output file name.
             tables_filename: Excel workbook file name (CSV/Markdown preview
                 companions are derived from this name automatically).
+            skip_tables: If True, run Marker + the cheap pdfplumber table scan
+                as usual, but never load/run the VLM/PaddleOCR/grid extraction
+                backends -- writes an empty placeholder tables file instead.
+                Useful for fast iteration (no GPU model loading) when you only
+                want to sanity-check the text pipeline and wiring.
 
         Returns:
             `UnifiedResult` with output paths, table count, which pages had
@@ -219,6 +228,11 @@ class UnifiedPDFPipeline:
             raise FileNotFoundError(f"PDF not found: {pdf_path}")
 
         out_dir = Path(output_dir).expanduser().resolve()
+        if out_dir.is_file():
+            raise NotADirectoryError(
+                f"--output-dir must be a DIRECTORY, but '{out_dir}' is already an existing FILE. "
+                f"Xoá/đổi tên file đó, hoặc chọn một thư mục khác (ví dụ: -o ./output)."
+            )
         out_dir.mkdir(parents=True, exist_ok=True)
 
         # Step A -- always: general text via Marker.
@@ -241,6 +255,22 @@ class UnifiedPDFPipeline:
                 tables_path=tables_path,
                 table_count=0,
                 pages_with_tables=[],
+                table_backend_used=BACKEND_NONE,
+            )
+
+        if skip_tables:
+            logger.info(
+                "skip_tables=True -- %d table page(s) detected but extraction backends "
+                "(VLM/PaddleOCR/grid) are NOT run.",
+                len(pages_with_tables),
+            )
+            export_tables_preview([], tables_path)
+            return UnifiedResult(
+                text_path=text_path,
+                markdown_path=markdown_path,
+                tables_path=tables_path,
+                table_count=0,
+                pages_with_tables=pages_with_tables,
                 table_backend_used=BACKEND_NONE,
             )
 
@@ -274,6 +304,11 @@ def _build_arg_parser():
     parser.add_argument("--input", "-i", required=True, help="Path to the input PDF file.")
     parser.add_argument("--output-dir", "-o", default="./output", help="Directory for output files.")
     parser.add_argument("--no-markdown", action="store_true", help="Do not save the intermediate Markdown file.")
+    parser.add_argument(
+        "--skip-tables",
+        action="store_true",
+        help="Fast test mode: run Marker + table detection only, skip VLM/PaddleOCR/grid extraction (no GPU model load).",
+    )
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging.")
     return parser
 
@@ -292,6 +327,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.input,
             output_dir=args.output_dir,
             save_markdown=not args.no_markdown,
+            skip_tables=args.skip_tables,
         )
     except Exception as exc:
         _logging.error("Pipeline failed: %s", exc)

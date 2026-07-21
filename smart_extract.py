@@ -41,6 +41,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not save the intermediate Markdown file.",
     )
+    parser.add_argument(
+        "--skip-tables",
+        action="store_true",
+        help=(
+            "Fast test mode: run Marker + the cheap table-page scan only, "
+            "skip VLM/PaddleOCR/grid extraction entirely (no GPU model load). "
+            "Use this to quickly sanity-check the text pipeline/wiring."
+        ),
+    )
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging.")
     return parser
 
@@ -62,6 +71,7 @@ def main(argv: list[str] | None = None) -> int:
             pdf_path,
             output_dir=args.output_dir,
             save_markdown=not args.no_markdown,
+            skip_tables=args.skip_tables,
         )
     except Exception as exc:
         logging.error("Pipeline failed: %s", exc)
