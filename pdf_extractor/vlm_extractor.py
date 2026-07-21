@@ -52,13 +52,28 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_OUTPUT_PATH = "output_tables.xlsx"
 
-# The strict extraction prompt. Kept literal/verbatim per spec -- any VLM
-# tends to drift into markdown/prose without this level of explicitness.
-TABLE_EXTRACTION_PROMPT = (
-    "Extract the table from this image. Return ONLY a valid JSON array of "
-    "objects representing the table rows. Do not include any markdown "
-    "formatting, preamble, or explanation."
-)
+# Fully generic: NO template name, NO fixed column list, NO form id.
+# The model must reconstruct whatever grid is visually present on THIS page.
+TABLE_EXTRACTION_PROMPT = """You are reading a PAGE IMAGE. Extract EVERY table by looking ONLY at the visual grid (ruled lines / cell layout) drawn on the image. Read characters from the IMAGE itself — do not trust any pre-existing OCR text layer.
+
+Rules (apply to ANY table, any language, any layout — never assume a named template or fixed schema):
+1. Preserve the exact column count of the printed grid. Never merge two adjacent cells into one value (e.g. two number cells must stay two separate strings).
+2. Empty cells must be the empty string "".
+3. Multi-line or multi-level headers: for each COLUMN, flatten the header text visible in that column into ONE string (join with a single space).
+4. One physical table -> one object. If the page has several separate tables, return several objects in the outer array.
+5. Return ONLY valid JSON. No markdown fences, no commentary, no trailing text.
+
+Exact JSON shape:
+[
+  {
+    "headers": ["...", "..."],
+    "rows": [
+      ["...", "..."],
+      ["...", "..."]
+    ]
+  }
+]
+"""
 
 
 class VLMExtractionError(Exception):
@@ -95,12 +110,15 @@ class VLMConfig:
     torch_dtype_name: str = "bfloat16"  # "bfloat16" preferred; falls back to "float16".
 
     # --- Generation parameters (see class docstring above for tuning advice) ---
-    max_new_tokens: int = 2048
+    # Large / multi-column forms need more tokens; truncated JSON is worse than slower runs.
+    max_new_tokens: int = 4096
     temperature: float = 0.1
     do_sample: bool = False
 
     # --- Page rendering ---
-    render_dpi: int = 300  # High-res rendering improves the VLM's ability to read small text.
+    # High-res rendering improves reading of small printed cells from the IMAGE
+    # (we deliberately do not use the PDF's embedded text layer).
+    render_dpi: int = 300
 
     # --- Prompt ---
     prompt: str = field(default=TABLE_EXTRACTION_PROMPT)
@@ -334,62 +352,195 @@ class VLMTableExtractor:
             return text[start : end + 1]
         return text
 
-    def _parse_json_response(self, raw_text: str) -> Optional[List[dict]]:
+    def _parse_json_response(self, raw_text: str) -> Optional[Any]:
         """
-        Parse the VLM's raw text output into a list of row-dicts.
+        Parse the VLM's raw text into a Python object (list or dict).
 
-        Wrapped in try/except around `json.loads` per spec -- if the model
-        hallucinates invalid JSON, this logs a warning and returns `None`
-        instead of raising, so the caller can skip this page gracefully.
+        If the model hallucinates invalid JSON, logs a warning and returns
+        `None` so the caller can skip this page gracefully.
         """
         candidate = self._strip_markdown_fences(raw_text)
-        candidate = self._extract_json_array_substring(candidate)
-
+        # Prefer outer array; if the model returned a single object, fall back
+        # to the first {...} span instead.
+        array_candidate = self._extract_json_array_substring(candidate)
         try:
-            data = json.loads(candidate)
-        except (json.JSONDecodeError, TypeError) as exc:
-            logger.warning("VLM response was not valid JSON (%s). Raw response: %.200s", exc, raw_text)
-            return None
+            return json.loads(array_candidate)
+        except (json.JSONDecodeError, TypeError):
+            pass
 
-        if not isinstance(data, list):
-            logger.warning("VLM JSON was valid but not a list of row objects -- skipping.")
-            return None
+        obj_start, obj_end = candidate.find("{"), candidate.rfind("}")
+        if obj_start != -1 and obj_end > obj_start:
+            try:
+                return json.loads(candidate[obj_start : obj_end + 1])
+            except (json.JSONDecodeError, TypeError) as exc:
+                logger.warning("VLM response was not valid JSON (%s). Raw: %.200s", exc, raw_text)
+                return None
 
-        return data
+        logger.warning("VLM response was not valid JSON. Raw: %.200s", raw_text)
+        return None
 
     @staticmethod
-    def _to_dataframe(rows: List[dict]) -> Optional[pd.DataFrame]:
-        """Convert a JSON array of row-objects into a DataFrame; None if empty."""
-        if not rows:
+    def _normalize_cell(value: Any) -> str:
+        if value is None:
+            return ""
+        return str(value).replace("\n", " ").strip()
+
+    @classmethod
+    def _grid_to_dataframe(cls, headers: List[Any], rows: List[Any]) -> Optional[pd.DataFrame]:
+        """Build a DataFrame from a headers list + list-of-lists body (grid form)."""
+        if not isinstance(rows, list) or not rows:
+            # Header-only / empty body still counts as a detected table scaffold.
+            if headers:
+                cols = [cls._normalize_cell(h) or f"Column_{i + 1}" for i, h in enumerate(headers)]
+                return pd.DataFrame(columns=cls._dedupe_columns(cols))
             return None
-        try:
-            return pd.DataFrame(rows)
-        except (ValueError, TypeError) as exc:
-            logger.warning("Failed to build a DataFrame from parsed JSON rows: %s", exc)
+
+        width = max(len(headers) if headers else 0, max((len(r) for r in rows if isinstance(r, list)), default=0))
+        if width == 0:
             return None
+
+        if headers and len(headers) == width:
+            cols = [cls._normalize_cell(h) or f"Column_{i + 1}" for i, h in enumerate(headers)]
+        elif headers:
+            cols = [cls._normalize_cell(h) or f"Column_{i + 1}" for i, h in enumerate(headers)]
+            while len(cols) < width:
+                cols.append(f"Column_{len(cols) + 1}")
+            cols = cols[:width]
+        else:
+            cols = [f"Column_{i + 1}" for i in range(width)]
+
+        cols = cls._dedupe_columns(cols)
+        normalized: List[List[str]] = []
+        for row in rows:
+            if not isinstance(row, list):
+                continue
+            cells = [cls._normalize_cell(c) for c in row]
+            if len(cells) < width:
+                cells = cells + [""] * (width - len(cells))
+            normalized.append(cells[:width])
+
+        if not normalized and not headers:
+            return None
+        return pd.DataFrame(normalized, columns=cols)
+
+    @staticmethod
+    def _dedupe_columns(names: List[str]) -> List[str]:
+        seen: dict[str, int] = {}
+        out: List[str] = []
+        for name in names:
+            base = name or "Column"
+            if base not in seen:
+                seen[base] = 1
+                out.append(base)
+            else:
+                seen[base] += 1
+                out.append(f"{base}_{seen[base]}")
+        return out
+
+    @classmethod
+    def _payload_to_dataframes(cls, data: Any) -> List[pd.DataFrame]:
+        """
+        Accept several generic JSON shapes the VLM may emit — none of them
+        encode a document template; they only describe a visual grid:
+
+          A) [ {"headers": [...], "rows": [[...], ...] }, ... ]
+          B)   {"headers": [...], "rows": [[...], ...] }
+          C) [ ["h1","h2"], ["r1c1","r1c2"], ... ]   # first row = header
+          D) [ {"colA": "...", "colB": "..."}, ... ]  # list of row objects
+          E) {"tables": [ <A/B/C/D>... ]}
+        """
+        if data is None:
+            return []
+
+        if isinstance(data, dict) and "tables" in data:
+            frames: List[pd.DataFrame] = []
+            for item in data["tables"]:
+                frames.extend(cls._payload_to_dataframes(item))
+            return frames
+
+        if isinstance(data, dict) and ("rows" in data or "headers" in data):
+            df = cls._grid_to_dataframe(list(data.get("headers") or []), list(data.get("rows") or []))
+            return [df] if df is not None else []
+
+        if isinstance(data, list) and data and all(isinstance(x, dict) and ("rows" in x or "headers" in x) for x in data):
+            frames = []
+            for item in data:
+                frames.extend(cls._payload_to_dataframes(item))
+            return frames
+
+        if isinstance(data, list) and data and all(isinstance(x, list) for x in data):
+            # Pure 2D grid: treat first row as headers when it looks non-numeric-heavy.
+            headers, body = data[0], data[1:]
+            df = cls._grid_to_dataframe(list(headers), body)
+            return [df] if df is not None else []
+
+        if isinstance(data, list) and data and all(isinstance(x, dict) for x in data):
+            try:
+                df = pd.DataFrame(data)
+            except (ValueError, TypeError) as exc:
+                logger.warning("Failed to build DataFrame from row-objects: %s", exc)
+                return []
+            return [df] if not df.empty else []
+
+        logger.warning("Unrecognized VLM JSON shape (%s) -- skipping.", type(data).__name__)
+        return []
+
+    @staticmethod
+    def _stitch_continuation_tables(tables: List[pd.DataFrame]) -> List[pd.DataFrame]:
+        """
+        Generic multi-page stitch: if consecutive tables have the SAME column
+        count, treat the later one as a continuation of the earlier one and
+        concatenate rows (using the first table's column names). No template
+        knowledge — only structural similarity.
+        """
+        if len(tables) <= 1:
+            return tables
+
+        stitched: List[pd.DataFrame] = [tables[0].copy()]
+        for nxt in tables[1:]:
+            prev = stitched[-1]
+            if len(prev.columns) == len(nxt.columns) and len(prev.columns) > 0:
+                cont = nxt.copy()
+                cont.columns = list(prev.columns)
+                stitched[-1] = pd.concat([prev, cont], ignore_index=True)
+                logger.info(
+                    "Stitched continuation table (%d + %d rows, %d cols).",
+                    len(prev),
+                    len(nxt),
+                    len(prev.columns),
+                )
+            else:
+                stitched.append(nxt.copy())
+        return stitched
 
     # ------------------------------------------------------------------
     # Per-page + full-document extraction
     # ------------------------------------------------------------------
-    def extract_table_from_image(self, image: Image.Image) -> Optional[pd.DataFrame]:
+    def extract_tables_from_image(self, image: Image.Image) -> List[pd.DataFrame]:
         """
-        Run the full single-page pipeline: inference -> JSON parse -> DataFrame.
+        Run the full single-page pipeline: inference -> JSON parse -> DataFrame(s).
 
-        Returns `None` (never raises) if the page had no table, or if the
-        VLM's output could not be parsed -- callers should treat `None` as
-        "skip this page" rather than a fatal error.
+        Returns an empty list (never raises) if the page had no table, or if
+        the VLM's output could not be parsed -- callers should treat that as
+        "skip this page" rather than a fatal error. One page may yield
+        multiple tables when several distinct grids are present.
         """
         try:
             raw_text = self._run_inference(image)
         except Exception as exc:  # pragma: no cover - defensive: GPU/runtime errors
             logger.warning("VLM inference failed on a page: %s", exc)
-            return None
+            return []
 
-        rows = self._parse_json_response(raw_text)
-        if rows is None:
-            return None
+        payload = self._parse_json_response(raw_text)
+        if payload is None:
+            return []
 
-        return self._to_dataframe(rows)
+        return self._payload_to_dataframes(payload)
+
+    def extract_table_from_image(self, image: Image.Image) -> Optional[pd.DataFrame]:
+        """Backward-compatible wrapper: first table on the page, or None."""
+        tables = self.extract_tables_from_image(image)
+        return tables[0] if tables else None
 
     def extract_pages(
         self,
@@ -407,12 +558,15 @@ class VLMTableExtractor:
         pure prose. Pass `page_indices=None` to process every page (used by
         the standalone `extract()` / CLI entrypoint below).
 
+        Pages are rendered to IMAGES (the PDF text layer is never read for
+        table cells). Consecutive page tables with the same column count are
+        stitched into one DataFrame (generic continuation, no template).
+
         Does NOT write any file -- callers own export (so the orchestrator
         can combine results from multiple backends into one workbook).
 
         Returns:
-            One cleaned DataFrame per requested page that yielded a usable
-            table (may be an empty list -- not an error condition on its own).
+            Cleaned DataFrame(s) for every usable table found (may be empty).
         """
         pdf_path = Path(pdf_path)
 
@@ -425,16 +579,14 @@ class VLMTableExtractor:
 
         dataframes: List[pd.DataFrame] = []
         for image in page_images:
-            df = self.extract_table_from_image(image)
-            if df is None or df.empty:
-                continue
+            for df in self.extract_tables_from_image(image):
+                if df is None or df.empty:
+                    continue
+                if apply_ocr_cleanup:
+                    df = clean_ocr_errors(df)
+                dataframes.append(df)
 
-            if apply_ocr_cleanup:
-                df = clean_ocr_errors(df)
-
-            dataframes.append(df)
-
-        return dataframes
+        return self._stitch_continuation_tables(dataframes)
 
     def extract(
         self,

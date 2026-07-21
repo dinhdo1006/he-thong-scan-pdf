@@ -88,6 +88,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  Tables ({result.table_count}):           {result.tables_path}")
         preview_path = result.tables_path.with_name(result.tables_path.stem + "_preview.md")
         print(f"  Preview (VS Code):    {preview_path}")
+        print("  Note: evaluate TABLE quality from the xlsx/preview above,")
+        print("        NOT from output_markdown.md (that file is Marker prose).")
     else:
         print("  No tables detected -- table extraction skipped (GPU untouched).")
 
