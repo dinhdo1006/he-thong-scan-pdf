@@ -1,4 +1,4 @@
-"""Offline tests for export_document (.docx) -- no GPU, no PDF needed."""
+"""Offline tests for unified plain-text export -- no GPU, no PDF needed."""
 
 from __future__ import annotations
 
@@ -8,49 +8,64 @@ from tempfile import TemporaryDirectory
 
 import pandas as pd
 
-from pdf_extractor.exporters import export_document
+from pdf_extractor.exporters import compose_document_txt, resolve_output_path, save_unified_txt
 
 
-class TestExportDocument(unittest.TestCase):
-    def test_writes_docx_with_text_and_table(self) -> None:
-        from docx import Document
+SAMPLE_MD = """# Report
 
-        df = pd.DataFrame(
-            [["10.620.000", "10.370.000", "250.000"]],
-            columns=["c1", "c2", "c3"],
-        )
+Intro paragraph.
+
+| Name | Age |
+|------|-----|
+| Alice | 30 |
+
+More text after table.
+"""
+
+
+class TestComposeDocumentTxt(unittest.TestCase):
+    def test_uses_extracted_table_when_available(self) -> None:
+        extracted = [pd.DataFrame([["99", "88"]], columns=["Name", "Age"])]
+        txt = compose_document_txt(SAMPLE_MD, extracted, apply_ocr_cleanup=False)
+        self.assertIn("Intro paragraph", txt)
+        self.assertIn("More text after table", txt)
+        self.assertIn("99\t88", txt)
+        self.assertNotIn("Alice", txt)
+
+    def test_falls_back_to_marker_table_when_extraction_empty(self) -> None:
+        txt = compose_document_txt(SAMPLE_MD, [], apply_ocr_cleanup=False)
+        self.assertIn("Alice", txt)
+        self.assertIn("30", txt)
+        self.assertNotIn("|---|", txt)
+
+    def test_preserves_reading_order(self) -> None:
+        txt = compose_document_txt(SAMPLE_MD, [], apply_ocr_cleanup=False)
+        intro_pos = txt.find("Intro paragraph")
+        table_pos = txt.find("Alice")
+        after_pos = txt.find("More text after")
+        self.assertLess(intro_pos, table_pos)
+        self.assertLess(table_pos, after_pos)
+
+
+class TestResolveOutputPath(unittest.TestCase):
+    def test_file_path(self) -> None:
         with TemporaryDirectory() as tmp:
-            out_path = Path(tmp) / "output.docx"
-            export_document("Some prose text.\n\nSecond paragraph.", [df], out_path)
+            p = resolve_output_path(Path(tmp) / "out.txt")
+            self.assertEqual(p.name, "out.txt")
 
-            self.assertTrue(out_path.is_file())
-
-            doc = Document(str(out_path))
-            self.assertEqual(len(doc.tables), 1)
-            table = doc.tables[0]
-            # 1 header row + 1 data row, 3 columns -- no merged/dropped cells.
-            self.assertEqual(len(table.rows), 2)
-            self.assertEqual(len(table.columns), 3)
-            self.assertEqual(table.rows[0].cells[0].text, "c1")
-            self.assertEqual(table.rows[1].cells[0].text, "10.620.000")
-            self.assertEqual(table.rows[1].cells[1].text, "10.370.000")
-            self.assertEqual(table.rows[1].cells[2].text, "250.000")
-
-            full_text = "\n".join(p.text for p in doc.paragraphs)
-            self.assertIn("Some prose text.", full_text)
-            self.assertIn("Second paragraph.", full_text)
-
-    def test_writes_placeholder_when_no_tables(self) -> None:
-        from docx import Document
-
+    def test_directory_gets_default_filename(self) -> None:
         with TemporaryDirectory() as tmp:
-            out_path = Path(tmp) / "output.docx"
-            export_document("Just text, no tables.", [], out_path)
+            p = resolve_output_path(Path(tmp) / "folder")
+            self.assertEqual(p.name, "output.txt")
+            self.assertEqual(p.parent.name, "folder")
 
-            doc = Document(str(out_path))
-            self.assertEqual(len(doc.tables), 0)
-            full_text = "\n".join(p.text for p in doc.paragraphs)
-            self.assertIn("Không phát hiện bảng", full_text)
+
+class TestSaveUnifiedTxt(unittest.TestCase):
+    def test_writes_utf8_file(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "result.txt"
+            save_unified_txt("Xin chào\n", path)
+            self.assertEqual(path.read_text(encoding="utf-8"), "Xin chào\n")
 
 
 if __name__ == "__main__":

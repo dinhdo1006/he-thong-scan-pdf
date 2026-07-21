@@ -1,13 +1,123 @@
-"""Export parsed tables and text to Excel / CSV / Markdown / plain-text files."""
+"""Export parsed tables and text to plain-text (and optional debug formats)."""
 
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 import pandas as pd
 
+from .markdown_parser import MarkdownBlockParser
+from .ocr_cleanup import clean_ocr_errors, clean_text_ocr_errors
+
 logger = logging.getLogger(__name__)
+
+DEFAULT_OUTPUT_TXT = "output.txt"
+
+
+def resolve_output_path(output: str | Path, default_name: str = DEFAULT_OUTPUT_TXT) -> Path:
+    """
+    Resolve CLI `-o` to a single `.txt` file path.
+
+    - `result.txt`           -> that file
+    - `./output` (directory) -> `./output/output.txt`
+    """
+    path = Path(output).expanduser()
+    if path.suffix.lower() == ".txt":
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path.resolve()
+    path.mkdir(parents=True, exist_ok=True)
+    return (path / default_name).resolve()
+
+
+def _markdown_text_to_plain(text: str) -> str:
+    """Light cleanup: headings and inline HTML from Marker -> plain text."""
+    lines: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("##"):
+            stripped = re.sub(r"^#+\s*", "", stripped)
+        stripped = stripped.replace("<br>", " ").replace("<br/>", " ").replace("<br />", " ")
+        lines.append(stripped)
+    return "\n".join(lines).strip()
+
+
+def dataframe_to_plaintext_table(df: pd.DataFrame) -> str:
+    """Render a DataFrame as a tab-separated plain-text grid."""
+    if df.empty or len(df.columns) == 0:
+        return ""
+    columns = [str(c).replace("\n", " ").replace("<br>", " ").replace("<br/>", " ").replace("\t", " ") for c in df.columns]
+    lines = ["\t".join(columns)]
+    for _, row in df.iterrows():
+        cells = [
+            str(row[c]).replace("\n", " ").replace("<br>", " ").replace("<br/>", " ").replace("\t", " ")
+            for c in df.columns
+        ]
+        lines.append("\t".join(cells))
+    return "\n".join(lines)
+
+
+def compose_document_txt(
+    markdown: str,
+    extracted_tables: list[pd.DataFrame],
+    *,
+    apply_ocr_cleanup: bool = True,
+) -> str:
+    """
+    Build ONE plain-text document from Marker Markdown + optional extracted tables.
+
+    Walks Markdown blocks in reading order. For each table block:
+      - use the next extracted DataFrame when the VLM/grid backend succeeded;
+      - otherwise keep Marker's table for that block (so content is never lost).
+
+  Prose blocks are lightly cleaned (headings, <br>) and run through
+  `ocr_corrections.json`.
+    """
+    blocks = MarkdownBlockParser().parse_blocks(markdown)
+    extracted_queue = list(extracted_tables)
+    parts: list[str] = []
+
+    for block in blocks:
+        if block.kind == "text":
+            plain = _markdown_text_to_plain(str(block.content))
+            if apply_ocr_cleanup:
+                plain = clean_text_ocr_errors(plain)
+            if plain.strip():
+                parts.append(plain)
+            continue
+
+        df = extracted_queue.pop(0) if extracted_queue else block.content
+        assert isinstance(df, pd.DataFrame)
+        if apply_ocr_cleanup:
+            df = clean_ocr_errors(df)
+        table_txt = dataframe_to_plaintext_table(df)
+        if table_txt.strip():
+            parts.append(table_txt)
+
+    # Rare: backend returned MORE tables than Marker blocks (e.g. stitched pages).
+    while extracted_queue:
+        df = extracted_queue.pop(0)
+        if apply_ocr_cleanup:
+            df = clean_ocr_errors(df)
+        table_txt = dataframe_to_plaintext_table(df)
+        if table_txt.strip():
+            parts.append(table_txt)
+
+    body = "\n\n".join(parts)
+    return body.rstrip() + ("\n" if body.strip() else "")
+
+
+def save_unified_txt(content: str, output_path: str | Path) -> Path:
+    """Write the final unified document to a UTF-8 `.txt` file."""
+    path = Path(output_path).expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.write_text(content if content.endswith("\n") else content + "\n", encoding="utf-8")
+    except Exception as exc:
+        raise IOError(f"Failed to write text file '{path}': {exc}") from exc
+    logger.info("Saved unified text (%d chars) -> %s", len(content), path)
+    return path
 
 
 def export_tables_preview(

@@ -89,21 +89,16 @@ def _get_default_pipeline() -> UnifiedPDFPipeline:
 
 def route_and_extract(
     pdf_path: str | Path,
-    output_dir: str | Path = DEFAULT_OUTPUT_DIR,
+    output: str | Path = DEFAULT_OUTPUT_DIR,
 ) -> UnifiedResult:
     """
-    End-to-end entrypoint: every PDF goes through the same content-driven
-    pipeline (Marker for text; VLM/Paddle/grid for tables only if present).
-
-    Kept for backward compatibility with code that imports `route_and_extract`
-    from `pdf_extractor` -- delegates entirely to `UnifiedPDFPipeline`.
+    End-to-end entrypoint: every PDF -> single `.txt` output.
 
     Args:
         pdf_path: Path to the input PDF.
-        output_dir: Directory for output files (created if missing).
+        output: Output `.txt` path, or directory (writes `output.txt` inside).
 
     Returns:
-        `UnifiedResult` with output paths, table count, which pages had
-        tables, and which backend ultimately produced them.
+        `UnifiedResult` with output path and extraction stats.
     """
-    return _get_default_pipeline().run(pdf_path, output_dir=output_dir)
+    return _get_default_pipeline().run(pdf_path, output=output)

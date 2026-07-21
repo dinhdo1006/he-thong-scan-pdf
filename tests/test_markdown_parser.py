@@ -35,7 +35,7 @@ class TestSeparatorRegex(unittest.TestCase):
     def test_non_separator(self) -> None:
         self.assertFalse(SEPARATOR_RE.match("| Name | Age |"))
         self.assertFalse(SEPARATOR_RE.match("just text"))
-        self.assertFalse(SEPARATOR_RE.match("| - |"))  # fewer than 3 dashes
+        self.assertFalse(SEPARATOR_RE.match("| - |"))  # single dash is not a separator
 
 
 class TestMarkdownBlockParser(unittest.TestCase):
@@ -67,6 +67,13 @@ class TestMarkdownBlockParser(unittest.TestCase):
         result = self.parser.parse("Price | notes without separator\n\nHello\n")
         self.assertEqual(len(result.tables), 0)
         self.assertIn("Price | notes", result.text)
+
+    def test_parse_blocks_preserves_order(self) -> None:
+        blocks = self.parser.parse_blocks(SAMPLE_MD)
+        kinds = [b.kind for b in blocks]
+        self.assertEqual(kinds, ["text", "table", "text", "table", "text"])
+        self.assertIn("Intro paragraph", blocks[0].content)
+        self.assertEqual(blocks[1].content.iloc[0]["Name"], "Alice")
 
 
 if __name__ == "__main__":

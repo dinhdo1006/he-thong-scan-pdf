@@ -140,3 +140,19 @@ def clean_ocr_errors(
 
     logger.info("OCR cleanup: applied %d replacement(s) across %d column(s).", total_fixes, len(target_columns))
     return cleaned
+
+
+def clean_text_ocr_errors(
+    text: str,
+    replacements: Optional[Dict[str, str]] = None,
+    corrections_path: str | Path = DEFAULT_CORRECTIONS_PATH,
+) -> str:
+    """
+    Apply the same JSON-driven find-and-replace pass to a plain string.
+
+    Used for Marker prose before writing the final `.txt` output.
+    """
+    replacements = replacements if replacements is not None else load_corrections(corrections_path)
+    if not replacements or not text:
+        return text
+    return _replace_all(text, replacements)

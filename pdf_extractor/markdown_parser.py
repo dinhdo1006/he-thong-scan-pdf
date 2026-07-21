@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
+from typing import Literal
 
 import pandas as pd
 
@@ -25,8 +26,9 @@ logger = logging.getLogger(__name__)
 #   ( \| \s*:?-{3,}:?\s* )+   one or more additional "| ---" column groups
 #   \|?\s*$          optional trailing pipe
 #
+# Minimum 2 dashes per column segment (Marker sometimes emits `--` not `---`).
 SEPARATOR_RE = re.compile(
-    r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$"
+    r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$"
 )
 
 # A candidate table row must contain at least one pipe character.
@@ -41,6 +43,14 @@ class ParseResult:
     text: str = ""
 
 
+@dataclass
+class DocumentBlock:
+    """One ordered slice of a Marker Markdown document."""
+
+    kind: Literal["text", "table"]
+    content: str | pd.DataFrame
+
+
 class MarkdownBlockParser:
     """
     Line-by-line Markdown parser that separates pipe tables from prose.
@@ -49,6 +59,52 @@ class MarkdownBlockParser:
     (or is itself) a separator matching SEPARATOR_RE. This avoids treating
     prose lines that happen to contain a single '|' as tables.
     """
+
+    def parse_blocks(self, markdown: str) -> list[DocumentBlock]:
+        """
+        Walk Markdown and return an ORDERED list of text / table blocks.
+
+        Preserves the original reading order (prose, then table, then more
+        prose, ...) so callers can reassemble one plain-text file without
+        losing content when a downstream table extractor fails.
+        """
+        lines = markdown.splitlines()
+        blocks: list[DocumentBlock] = []
+        text_lines: list[str] = []
+
+        def flush_text() -> None:
+            if not text_lines:
+                return
+            text = "\n".join(text_lines).rstrip()
+            if text:
+                blocks.append(DocumentBlock(kind="text", content=text))
+            text_lines.clear()
+
+        i = 0
+        n = len(lines)
+        while i < n:
+            if self._is_table_start(lines, i):
+                flush_text()
+                table_lines, next_i = self._consume_table_block(lines, i)
+                df = self._table_lines_to_dataframe(table_lines)
+                if df is not None and not df.empty:
+                    blocks.append(DocumentBlock(kind="table", content=df))
+                    logger.debug("Block table_%d shape %s", sum(1 for b in blocks if b.kind == "table"), df.shape)
+                else:
+                    text_lines.extend(table_lines)
+                i = next_i
+                continue
+            text_lines.append(lines[i])
+            i += 1
+
+        flush_text()
+        logger.info(
+            "Parsed %d block(s): %d table(s), %d text block(s).",
+            len(blocks),
+            sum(1 for b in blocks if b.kind == "table"),
+            sum(1 for b in blocks if b.kind == "text"),
+        )
+        return blocks
 
     def parse(self, markdown: str) -> ParseResult:
         """
@@ -60,45 +116,12 @@ class MarkdownBlockParser:
         Returns:
             ParseResult with DataFrames and remaining text (paragraph spacing kept).
         """
-        lines = markdown.splitlines()
-        tables: list[pd.DataFrame] = []
-        text_lines: list[str] = []
-
-        i = 0
-        n = len(lines)
-
-        while i < n:
-            # --- Detect start of a Markdown table block --------------------
-            # Condition: current line has '|', AND either:
-            #   (a) the NEXT line is a separator (|---|), or
-            #   (b) the CURRENT line is itself a separator (rare edge case).
-            if self._is_table_start(lines, i):
-                table_lines, next_i = self._consume_table_block(lines, i)
-                df = self._table_lines_to_dataframe(table_lines)
-                if df is not None and not df.empty:
-                    tables.append(df)
-                    logger.debug(
-                        "Extracted Table_%d with shape %s",
-                        len(tables),
-                        df.shape,
-                    )
-                else:
-                    # Failed to parse → keep original lines as text
-                    text_lines.extend(table_lines)
-                i = next_i
-                continue
-
-            # Non-table line: preserve as-is (including blank lines)
-            text_lines.append(lines[i])
-            i += 1
-
-        # Collapse runs of trailing blank lines but keep paragraph gaps
-        text = "\n".join(text_lines).rstrip() + ("\n" if text_lines else "")
-        logger.info(
-            "Parsed %d table(s); text length %d chars.",
-            len(tables),
-            len(text),
-        )
+        blocks = self.parse_blocks(markdown)
+        tables = [b.content for b in blocks if b.kind == "table"]
+        text_parts = [b.content for b in blocks if b.kind == "text"]
+        text = "\n\n".join(text_parts)
+        if text_parts:
+            text = text.rstrip() + "\n"
         return ParseResult(tables=tables, text=text)
 
     # ------------------------------------------------------------------

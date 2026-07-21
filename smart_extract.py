@@ -1,23 +1,10 @@
 #!/usr/bin/env python3
 """
-CLI entrypoint: Unified, content-driven PDF pipeline.
-
-Every input PDF goes through the SAME sequence, regardless of template,
-keyword, or filename:
-    1. Marker            -> general text (output_text.txt / output_markdown.md)
-    2. pdfplumber scan   -> which pages physically contain a table
-    3. If (and only if) step 2 found tables:
-         VLM (Qwen2-VL) -> PaddleOCR PP-Structure -> pdfplumber grid
-       (first backend that produces usable tables wins)
-       -> output_tables.xlsx (+ CSV / Markdown preview companions)
-    4. If step 2 found nothing anywhere, table extraction (and the GPU) is
-       skipped entirely.
-
-No filename keyword, template name, or per-document configuration is used
-anywhere in this decision path.
+CLI entrypoint: Unified PDF -> single plain-text .txt output.
 
 Usage:
-    python smart_extract.py --input path/to/file.pdf --output-dir ./output
+    python smart_extract.py -i path/to/file.pdf -o result.txt
+    python smart_extract.py -i path/to/file.pdf -o ./output   # writes ./output/output.txt
 """
 
 from __future__ import annotations
@@ -27,28 +14,25 @@ import logging
 import sys
 from pathlib import Path
 
+from pdf_extractor.exporters import DEFAULT_OUTPUT_TXT
 from pdf_extractor.unified_pipeline import UnifiedPDFPipeline
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Content-driven PDF pipeline: text always, tables only if physically present."
+        description="Extract PDF to a single plain-text .txt file (prose + tables)."
     )
     parser.add_argument("--input", "-i", required=True, help="Path to the input PDF file.")
-    parser.add_argument("--output-dir", "-o", default="./output", help="Directory for output files.")
     parser.add_argument(
-        "--no-markdown",
-        action="store_true",
-        help="Do not save the intermediate Markdown file.",
+        "--output",
+        "-o",
+        default=DEFAULT_OUTPUT_TXT,
+        help="Output .txt path, or a directory (writes output.txt inside).",
     )
     parser.add_argument(
         "--skip-tables",
         action="store_true",
-        help=(
-            "Fast test mode: run Marker + the cheap table-page scan only, "
-            "skip VLM/PaddleOCR/grid extraction entirely (no GPU model load). "
-            "Use this to quickly sanity-check the text pipeline/wiring."
-        ),
+        help="Fast test: Marker only, skip VLM/Paddle/grid (no GPU model load).",
     )
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging.")
     return parser
@@ -69,8 +53,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         result = UnifiedPDFPipeline().run(
             pdf_path,
-            output_dir=args.output_dir,
-            save_markdown=not args.no_markdown,
+            output=args.output,
             skip_tables=args.skip_tables,
         )
     except Exception as exc:
@@ -78,24 +61,14 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print("Done.")
-    print(f"  Text:                 {result.text_path}")
-    if result.markdown_path:
-        print(f"  Markdown:             {result.markdown_path}")
-    print(f"  Word document:        {result.docx_path}")
-
+    print(f"  Output:             {result.output_path}")
     if result.pages_with_tables:
-        print(f"  Tables on page(s):    {[p + 1 for p in result.pages_with_tables]}")
-        print(f"  Backend used:         {result.table_backend_used}")
-        print(f"  Tables ({result.table_count}):           {result.tables_path}")
-        preview_path = result.tables_path.with_name(result.tables_path.stem + "_preview.md")
-        print(f"  Preview (VS Code):    {preview_path}")
-        if result.table_count == 0:
-            print("  WARNING: table page(s) were detected but every backend returned")
-            print("           zero tables -- see the ERROR/WARNING log lines above.")
-        print("  Note: evaluate TABLE quality from xlsx/preview/docx above,")
-        print("        NOT from output_markdown.md (that file is Marker's raw guess).")
+        print(f"  Table page(s):      {[p + 1 for p in result.pages_with_tables]}")
+        print(f"  Backend:            {result.table_backend_used}")
+        if result.used_marker_table_fallback:
+            print("  Note: ML backends failed/skipped -- tables taken from Marker OCR.")
     else:
-        print("  No tables detected -- table extraction skipped (GPU untouched).")
+        print("  No tables detected -- text-only extraction.")
 
     return 0
 
