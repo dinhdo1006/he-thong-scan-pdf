@@ -5,6 +5,7 @@ PyMuPDF>=1.24.0
 pdfplumber>=0.11.0
 Pillow>=10.0.0
 lxml>=5.0.0
+python-docx>=1.1.0
 
 # --- Local Vision-Language Model (VLM) table extraction (pdf_extractor/vlm_extractor.py) ---
 # Requires a CUDA-equipped GPU server. Install a torch build matching your

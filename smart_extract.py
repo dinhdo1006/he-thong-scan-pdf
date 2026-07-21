@@ -81,6 +81,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  Text:                 {result.text_path}")
     if result.markdown_path:
         print(f"  Markdown:             {result.markdown_path}")
+    print(f"  Word document:        {result.docx_path}")
 
     if result.pages_with_tables:
         print(f"  Tables on page(s):    {[p + 1 for p in result.pages_with_tables]}")
@@ -88,8 +89,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  Tables ({result.table_count}):           {result.tables_path}")
         preview_path = result.tables_path.with_name(result.tables_path.stem + "_preview.md")
         print(f"  Preview (VS Code):    {preview_path}")
-        print("  Note: evaluate TABLE quality from the xlsx/preview above,")
-        print("        NOT from output_markdown.md (that file is Marker prose).")
+        if result.table_count == 0:
+            print("  WARNING: table page(s) were detected but every backend returned")
+            print("           zero tables -- see the ERROR/WARNING log lines above.")
+        print("  Note: evaluate TABLE quality from xlsx/preview/docx above,")
+        print("        NOT from output_markdown.md (that file is Marker's raw guess).")
     else:
         print("  No tables detected -- table extraction skipped (GPU untouched).")
 

@@ -114,6 +114,86 @@ class TableExporter:
         return written["xlsx"]
 
 
+def export_document(
+    text: str,
+    tables: list[pd.DataFrame],
+    output_path: str | Path,
+) -> Path:
+    """
+    Assemble one readable Word (.docx) file from ALREADY-STRUCTURED data:
+    plain prose paragraphs + real Word tables (one `python-docx` table per
+    DataFrame, one cell per DataFrame cell).
+
+    Deliberately NOT built by converting Marker's raw Markdown -- Marker's
+    own table guesses are unreliable on scanned/complex forms (merged cells,
+    OCR typos), so converting that Markdown to Word would just bake the same
+    mistakes into a different file format. This function only ever consumes:
+      - `text`: prose with tables already stripped out (see
+        `MarkdownBlockParser` / `unified_pipeline._extract_text`)
+      - `tables`: the DataFrames actually produced by the table-extraction
+        backend (VLM / PaddleOCR / pdfplumber grid), which is what carries a
+        real, verified column/row structure.
+
+    No layout reconstruction (merged header cells, stamp/signature
+    positioning, etc.) is attempted -- this produces a plain, readable
+    document: paragraphs, then each table as a normal Word table, in order.
+    """
+    from docx import Document
+
+    output_path = Path(output_path).expanduser().resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    doc = Document()
+
+    for paragraph in text.split("\n\n"):
+        stripped = paragraph.strip()
+        if not stripped:
+            continue
+        for line in stripped.splitlines():
+            if line.strip():
+                doc.add_paragraph(line.strip())
+        doc.add_paragraph("")
+
+    if not tables:
+        doc.add_paragraph("(Không phát hiện bảng nào trong tài liệu này.)")
+    else:
+        for idx, df in enumerate(tables, start=1):
+            doc.add_heading(f"Table {idx}", level=2)
+            n_rows, n_cols = len(df), len(df.columns)
+            if n_cols == 0:
+                continue
+            table = doc.add_table(rows=n_rows + 1, cols=n_cols)
+            table.style = "Table Grid"
+
+            header_cells = table.rows[0].cells
+            for col_idx, col_name in enumerate(df.columns):
+                header_cells[col_idx].text = str(col_name)
+                for run in header_cells[col_idx].paragraphs[0].runs:
+                    run.bold = True
+
+            for row_idx, row in enumerate(df.itertuples(index=False), start=1):
+                row_cells = table.rows[row_idx].cells
+                for col_idx, value in enumerate(row):
+                    row_cells[col_idx].text = "" if value is None else str(value)
+
+            doc.add_paragraph("")
+
+    try:
+        doc.save(str(output_path))
+    except Exception as exc:
+        raise IOError(f"Failed to write Word document '{output_path}': {exc}") from exc
+
+    logger.info("Saved Word document (%d table(s)) -> %s", len(tables), output_path)
+    return output_path
+
+
+class DocumentExporter:
+    """Assemble prose + extracted tables into one readable `.docx` file."""
+
+    def save(self, text: str, tables: list[pd.DataFrame], output_path: str | Path) -> Path:
+        return export_document(text, tables, output_path)
+
+
 class TextExporter:
     """Write non-table Markdown text to a UTF-8 plain text file."""
 

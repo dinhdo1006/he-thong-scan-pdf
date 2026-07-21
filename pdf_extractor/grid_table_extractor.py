@@ -36,7 +36,7 @@ import argparse
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import fitz  # PyMuPDF
 import numpy as np
@@ -217,22 +217,31 @@ def _render_page_grayscale(pdf_path: str | Path, page_index: int, dpi: int = DEF
         doc.close()
 
 
-def _count_line_clusters(ink_fraction: np.ndarray, threshold: float, gap: int = 3) -> int:
+def _line_cluster_spans(ink_fraction: np.ndarray, threshold: float, gap: int = 3) -> List[Tuple[int, int]]:
     """
-    Count distinct "bands" (runs of consecutive indices, merging gaps of up to
-    `gap` pixels) where `ink_fraction` exceeds `threshold`. A single thick
-    ruled line renders as several adjacent rows/columns above threshold --
-    this collapses that into ONE cluster, so cluster count roughly tracks
-    "how many ruling lines", not "how many pixels".
+    Group indices where `ink_fraction` exceeds `threshold` into (start, end)
+    spans, merging runs separated by up to `gap` pixels. A single thick ruled
+    line renders as several adjacent rows/columns above threshold -- this
+    collapses that into ONE span, so span count roughly tracks "how many
+    ruling lines", not "how many pixels".
     """
     above = np.where(ink_fraction > threshold)[0]
     if len(above) == 0:
-        return 0
-    clusters = 1
-    for prev, curr in zip(above, above[1:]):
-        if curr - prev > gap:
-            clusters += 1
-    return clusters
+        return []
+    spans: List[Tuple[int, int]] = []
+    start = prev = above[0]
+    for idx in above[1:]:
+        if idx - prev > gap:
+            spans.append((int(start), int(prev)))
+            start = idx
+        prev = idx
+    spans.append((int(start), int(prev)))
+    return spans
+
+
+def _count_line_clusters(ink_fraction: np.ndarray, threshold: float, gap: int = 3) -> int:
+    """Count distinct ruling-line bands (see `_line_cluster_spans`)."""
+    return len(_line_cluster_spans(ink_fraction, threshold, gap=gap))
 
 
 def page_looks_like_scanned_table(
@@ -259,6 +268,57 @@ def page_looks_like_scanned_table(
     horizontal_bands = _count_line_clusters(row_ink_fraction, line_fraction)
     vertical_bands = _count_line_clusters(col_ink_fraction, line_fraction)
     return horizontal_bands >= min_clusters and vertical_bands >= min_clusters
+
+
+def find_table_bbox(
+    pdf_path: str | Path,
+    page_index: int,
+    dpi: int = DEFAULT_VISUAL_DPI,
+    dark_threshold: int = DEFAULT_VISUAL_DARK_THRESHOLD,
+    line_fraction: float = DEFAULT_VISUAL_LINE_FRACTION,
+    min_clusters: int = DEFAULT_VISUAL_MIN_CLUSTERS,
+    padding_ratio: float = 0.02,
+) -> Optional[Tuple[float, float, float, float]]:
+    """
+    Locate the bounding box of the densest ruled-grid region on a page, in
+    PDF POINT coordinates (x0, y0, x1, y1) -- suitable for a `fitz.Rect` clip.
+
+    Purely pixel/ink-density driven (same signal as
+    `page_looks_like_scanned_table`): the box spans from the first to the
+    last detected horizontal/vertical ruling-line band, plus a small margin.
+    No template, header text, or column count is assumed -- this works for
+    ANY grid of ruled lines, on ANY document. Returns `None` if the page does
+    not look like it has a dense ruled grid at all (same threshold as
+    `page_looks_like_scanned_table`), so callers can fall back to the full
+    page image instead of cropping away real content.
+
+    Cropping the page to just this region before handing it to a VLM removes
+    unrelated noise (letterhead, signatures, stamps) so the model can focus
+    its limited attention/tokens on the actual grid.
+    """
+    gray = _render_page_grayscale(pdf_path, page_index, dpi=dpi)
+    dark = gray < dark_threshold
+    height, width = dark.shape
+    row_ink_fraction = dark.sum(axis=1) / width
+    col_ink_fraction = dark.sum(axis=0) / height
+    row_spans = _line_cluster_spans(row_ink_fraction, line_fraction)
+    col_spans = _line_cluster_spans(col_ink_fraction, line_fraction)
+
+    if len(row_spans) < min_clusters or len(col_spans) < min_clusters:
+        return None
+
+    y0_px, y1_px = row_spans[0][0], row_spans[-1][1]
+    x0_px, x1_px = col_spans[0][0], col_spans[-1][1]
+
+    pad_y = int((y1_px - y0_px) * padding_ratio) + 5
+    pad_x = int((x1_px - x0_px) * padding_ratio) + 5
+    y0_px = max(0, y0_px - pad_y)
+    y1_px = min(height, y1_px + pad_y)
+    x0_px = max(0, x0_px - pad_x)
+    x1_px = min(width, x1_px + pad_x)
+
+    scale = 72.0 / dpi  # pixels (at `dpi`) -> PDF points
+    return (x0_px * scale, y0_px * scale, x1_px * scale, y1_px * scale)
 
 
 def detect_table_pages(

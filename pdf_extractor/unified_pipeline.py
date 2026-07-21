@@ -40,7 +40,7 @@ from typing import List, Optional, Tuple
 
 import pandas as pd
 
-from .exporters import TextExporter, export_tables_preview
+from .exporters import TextExporter, export_document, export_tables_preview
 from .grid_table_extractor import (
     DEFAULT_TABLE_SETTINGS,
     detect_table_pages,
@@ -57,6 +57,18 @@ logger = logging.getLogger(__name__)
 DEFAULT_TEXT_FILENAME = "output_text.txt"
 DEFAULT_MARKDOWN_FILENAME = "output_markdown.md"
 DEFAULT_TABLES_FILENAME = "output_tables.xlsx"
+DEFAULT_DOCX_FILENAME = "output.docx"
+
+# Prepended to the saved intermediate Markdown so it's never mistaken for the
+# verified table output -- Marker's own table guesses on scanned/complex forms
+# are frequently wrong (merged cells, OCR typos); the real, checked tables
+# live in `output_tables.xlsx` / `_preview.md` / `output.docx` instead.
+_MARKDOWN_NOTE = (
+    "<!-- LƯU Ý: đây là Markdown thô của Marker (chỉ dùng để đọc văn bản).\n"
+    "     Mọi bảng hiển thị dưới đây là Marker tự đoán và có thể SAI cấu trúc/OCR.\n"
+    "     Bảng đã được kiểm tra/trích xuất thật nằm ở output_tables.xlsx,\n"
+    "     output_tables_preview.md, và output.docx — hãy đánh giá bảng ở đó. -->\n\n"
+)
 
 # Table-extraction backend identifiers, in fallback order.
 BACKEND_NONE = "none"
@@ -72,6 +84,7 @@ class UnifiedResult:
     text_path: Path
     markdown_path: Optional[Path]
     tables_path: Path
+    docx_path: Path
     table_count: int
     pages_with_tables: List[int] = field(default_factory=list)
     table_backend_used: str = BACKEND_NONE
@@ -131,7 +144,7 @@ class UnifiedPDFPipeline:
         markdown_path: Optional[Path] = None
         if save_markdown:
             markdown_path = out_dir / DEFAULT_MARKDOWN_FILENAME
-            markdown_path.write_text(markdown, encoding="utf-8")
+            markdown_path.write_text(_MARKDOWN_NOTE + markdown, encoding="utf-8")
             logger.info("Saved intermediate Markdown -> %s", markdown_path)
 
         # Reuse the existing pipe-table/text splitter purely to STRIP any
@@ -198,6 +211,7 @@ class UnifiedPDFPipeline:
         save_markdown: bool = True,
         text_filename: str = DEFAULT_TEXT_FILENAME,
         tables_filename: str = DEFAULT_TABLES_FILENAME,
+        docx_filename: str = DEFAULT_DOCX_FILENAME,
         skip_tables: bool = False,
     ) -> UnifiedResult:
         """
@@ -242,52 +256,49 @@ class UnifiedPDFPipeline:
         # Step B -- always: cheap structural scan for physical tables.
         pages_with_tables = self._detect_table_pages(pdf_path)
         tables_path = (out_dir / tables_filename).expanduser().resolve()
+        docx_path = (out_dir / docx_filename).expanduser().resolve()
 
-        # Step C -- only runs if Step B found something (saves GPU otherwise).
+        dataframes: List[pd.DataFrame] = []
+        backend = BACKEND_NONE
+
         if not pages_with_tables:
             logger.info(
                 "No tables detected anywhere in %s -- skipping table extraction (GPU untouched).", pdf_path
             )
             # Marker is no longer needed for this document -- free VRAM.
             self.marker.unload()
-            export_tables_preview([], tables_path)
-            return UnifiedResult(
-                text_path=text_path,
-                markdown_path=markdown_path,
-                tables_path=tables_path,
-                table_count=0,
-                pages_with_tables=[],
-                table_backend_used=BACKEND_NONE,
-            )
-
-        if skip_tables:
+        elif skip_tables:
             logger.info(
                 "skip_tables=True -- %d table page(s) detected but extraction backends "
                 "(VLM/PaddleOCR/grid) are NOT run.",
                 len(pages_with_tables),
             )
             self.marker.unload()
-            export_tables_preview([], tables_path)
-            return UnifiedResult(
-                text_path=text_path,
-                markdown_path=markdown_path,
-                tables_path=tables_path,
-                table_count=0,
-                pages_with_tables=pages_with_tables,
-                table_backend_used=BACKEND_NONE,
-            )
+        else:
+            # Critical on 16 GiB cards: Marker + Qwen2-VL-7B cannot coexist in VRAM.
+            # Drop Marker BEFORE Step C loads the VLM.
+            self.marker.unload()
 
-        # Critical on 16 GiB cards: Marker + Qwen2-VL-7B cannot coexist in VRAM.
-        # Drop Marker BEFORE Step C loads the VLM.
-        self.marker.unload()
+            dataframes, backend = self._extract_tables(pdf_path, out_dir, pages_with_tables)
+            if not dataframes:
+                logger.error(
+                    "Table page(s) %s were structurally/visually detected, but EVERY "
+                    "backend (VLM -> PaddleOCR -> pdfplumber grid) returned zero usable "
+                    "tables for %s. This is NOT the same as 'document has no tables' -- "
+                    "check the WARNING lines above (VLM raw response, OOM, PaddleOCR/grid "
+                    "errors) for the actual cause before trusting an empty output_tables.xlsx.",
+                    [p + 1 for p in pages_with_tables],
+                    pdf_path,
+                )
 
-        dataframes, backend = self._extract_tables(pdf_path, out_dir, pages_with_tables)
         export_tables_preview(dataframes, tables_path)
+        export_document(text, dataframes, docx_path)
 
         return UnifiedResult(
             text_path=text_path,
             markdown_path=markdown_path,
             tables_path=tables_path,
+            docx_path=docx_path,
             table_count=len(dataframes),
             pages_with_tables=pages_with_tables,
             table_backend_used=backend,
@@ -344,6 +355,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"  Text:              {result.text_path}")
     if result.markdown_path:
         print(f"  Markdown:          {result.markdown_path}")
+    print(f"  Word document:     {result.docx_path}")
     if result.pages_with_tables:
         print(f"  Tables detected on page(s): {[p + 1 for p in result.pages_with_tables]}")
         print(f"  Backend used:      {result.table_backend_used}")

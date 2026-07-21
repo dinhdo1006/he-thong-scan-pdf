@@ -7,7 +7,7 @@ the primary table-heavy-document route. Instead of hardcoded coordinates,
 anchor text, or even a dedicated table-structure-recognition model, this
 module hands the raw page IMAGE directly to a general-purpose VLM
 (`Qwen/Qwen2-VL-7B-Instruct` by default) and asks it to return the table as
-strict JSON.
+an HTML `<table>` (with a JSON grid as an automatic fallback shape).
 
 Design goals:
     - Enterprise-grade, object-oriented: a single `VLMTableExtractor` class
@@ -54,26 +54,37 @@ DEFAULT_OUTPUT_PATH = "output_tables.xlsx"
 
 # Fully generic: NO template name, NO fixed column list, NO form id.
 # The model must reconstruct whatever grid is visually present on THIS page.
-TABLE_EXTRACTION_PROMPT = """You are reading a PAGE IMAGE. Extract EVERY table by looking ONLY at the visual grid (ruled lines / cell layout) drawn on the image. Read characters from the IMAGE itself — do not trust any pre-existing OCR text layer.
+# HTML is the PRIMARY requested format -- an actual <table>/<tr>/<td> grid
+# maps much more directly onto "one ruled cell = one <td>" than a JSON object
+# does, and colspan/rowspan give the model an explicit way to describe merged
+# header cells instead of guessing at a flattened column list.
+TABLE_EXTRACTION_PROMPT = """You are reading a PAGE IMAGE. Find EVERY table by looking ONLY at the visual grid (ruled lines / cell borders) drawn on the image. Read every character from the IMAGE itself -- do not trust any pre-existing OCR text layer, it may be wrong.
 
-Rules (apply to ANY table, any language, any layout — never assume a named template or fixed schema):
-1. Preserve the exact column count of the printed grid. Never merge two adjacent cells into one value (e.g. two number cells must stay two separate strings).
-2. Empty cells must be the empty string "".
-3. Multi-line or multi-level headers: for each COLUMN, flatten the header text visible in that column into ONE string (join with a single space).
-4. One physical table -> one object. If the page has several separate tables, return several objects in the outer array.
-5. Return ONLY valid JSON. No markdown fences, no commentary, no trailing text.
+Rules (apply to ANY table, any language, any layout -- never assume a named template or fixed schema):
+1. Return each physical table as one HTML <table> element, in reading order.
+2. One row of the printed grid = one <tr>. One printed cell = one <td> (use <th> only for a clear header row/cell).
+3. Preserve the exact column count of the printed grid in every row. Never merge two adjacent cells into one value -- two separate number cells must stay two separate <td> cells.
+4. A cell with no visible text is still a cell: use an empty <td></td>, never omit it.
+5. If a header cell visually spans multiple columns or rows, use colspan/rowspan on that <th> exactly as printed -- do not flatten it into one column.
+6. Return ONLY the <table>...</table> element(s). No markdown fences, no <html>/<body> wrapper, no commentary before or after.
 
-Exact JSON shape:
-[
-  {
-    "headers": ["...", "..."],
-    "rows": [
-      ["...", "..."],
-      ["...", "..."]
-    ]
-  }
-]
+Example of the exact shape (structure only, not real content):
+<table>
+<tr><th>A</th><th colspan="2">B</th></tr>
+<tr><td>1</td><td>2</td><td>3</td></tr>
+</table>
 """
+
+# Appended to the HTML prompt above so a model/checkpoint that ignores the
+# HTML instruction still has a well-defined generic fallback shape to answer
+# in -- the parser (`_parse_vlm_response`) tries HTML first, then this JSON
+# shape, on every response.
+_JSON_FALLBACK_HINT = (
+    "\n\nIf you cannot produce HTML for some table, return that one as a JSON object "
+    'instead, shaped as {"headers": ["...", "..."], "rows": [["...", "..."]]}.'
+)
+
+TABLE_EXTRACTION_PROMPT = TABLE_EXTRACTION_PROMPT + _JSON_FALLBACK_HINT
 
 
 class VLMExtractionError(Exception):
@@ -119,6 +130,11 @@ class VLMConfig:
     # High-res rendering improves reading of small printed cells from the IMAGE
     # (we deliberately do not use the PDF's embedded text layer).
     render_dpi: int = 300
+    # Crop to the densest ruled-grid region (see grid_table_extractor.find_table_bbox)
+    # before sending the image to the VLM -- removes letterhead/signature/stamp
+    # noise so the model's limited attention focuses on the actual table. Falls
+    # back to the full page automatically when no such region is found.
+    crop_to_table: bool = True
 
     # --- Prompt ---
     prompt: str = field(default=TABLE_EXTRACTION_PROMPT)
@@ -131,6 +147,7 @@ def render_pdf_to_images(
     pdf_path: str | Path,
     dpi: int = 300,
     page_indices: Optional[List[int]] = None,
+    crop_to_table: bool = False,
 ) -> List[Image.Image]:
     """
     Rasterize specific pages (or all pages) of a PDF into high-resolution PIL Images.
@@ -149,6 +166,13 @@ def render_pdf_to_images(
             small subset (e.g. only pages a cheap pdfplumber scan flagged as
             containing a table) is what lets the orchestrator avoid wasting
             GPU time on pages that are pure prose.
+        crop_to_table: If True, crop each rendered page to the densest
+            ruled-grid region found by `grid_table_extractor.find_table_bbox`
+            (a generic, pixel-density heuristic -- no template/column
+            assumptions). Pages where no such region is detected are
+            rendered in full, unchanged. This removes letterhead/signature/
+            stamp noise around the table so the VLM's attention/tokens focus
+            on the grid itself.
 
     Returns:
         One PIL.Image (RGB) per requested page, in page order.
@@ -162,15 +186,34 @@ def render_pdf_to_images(
     zoom = dpi / 72.0
     matrix = fitz.Matrix(zoom, zoom)
 
+    bbox_by_page: dict[int, Any] = {}
+    if crop_to_table:
+        from .grid_table_extractor import find_table_bbox
+
+        indices_for_bbox = page_indices if page_indices is not None else None
+        with fitz.open(pdf_path) as _probe:
+            probe_indices = indices_for_bbox if indices_for_bbox is not None else range(_probe.page_count)
+        for i in probe_indices:
+            try:
+                bbox = find_table_bbox(pdf_path, i)
+            except Exception as exc:  # pragma: no cover - defensive: rendering failure
+                logger.warning("Table bbox detection failed on page %d: %s", i + 1, exc)
+                bbox = None
+            if bbox is not None:
+                bbox_by_page[i] = bbox
+
     images: List[Image.Image] = []
     doc = fitz.open(pdf_path)
     try:
         indices = page_indices if page_indices is not None else range(doc.page_count)
         for i in indices:
             page = doc[i]
-            pix = page.get_pixmap(matrix=matrix, colorspace=fitz.csRGB)
+            clip = fitz.Rect(*bbox_by_page[i]) if i in bbox_by_page else None
+            pix = page.get_pixmap(matrix=matrix, colorspace=fitz.csRGB, clip=clip)
             image = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
             images.append(image)
+            if clip is not None:
+                logger.info("Page %d: cropped to detected table region %s.", i + 1, tuple(round(v, 1) for v in clip))
     finally:
         doc.close()
 
@@ -328,7 +371,97 @@ class VLMTableExtractor:
         return output_text.strip()
 
     # ------------------------------------------------------------------
-    # Robust JSON parsing (VLMs can hallucinate formatting)
+    # HTML table parsing (primary path)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _extract_html_tables(text: str) -> List[str]:
+        """Find every `<table ...>...</table>` fragment in the raw response, in order."""
+        return re.findall(r"<table\b.*?</table>", text, flags=re.DOTALL | re.IGNORECASE)
+
+    @staticmethod
+    def _html_table_to_grid(html_fragment: str) -> Optional[List[List[str]]]:
+        """
+        Parse one `<table>` fragment into a dense 2D grid of raw cell text,
+        expanding `colspan`/`rowspan` generically (standard HTML-table-to-
+        grid algorithm: cells spanning multiple rows are "carried forward"
+        into a `pending` map until the row they land on is reached).
+
+        Deliberately does NOT use `pandas.read_html`: pandas silently
+        reinterprets numeric-looking cell text (e.g. "250.000" -> 250.0),
+        which corrupts exactly the kind of formatted numbers these forms are
+        full of. Every cell here stays a plain string, verbatim.
+        """
+        from lxml import html as lxml_html
+
+        try:
+            table_el = lxml_html.fromstring(html_fragment)
+        except Exception as exc:
+            logger.warning("lxml could not parse an HTML table fragment: %s", exc)
+            return None
+
+        row_elements = table_el.xpath(".//tr")
+        if not row_elements:
+            return None
+
+        grid: List[List[str]] = []
+        pending: dict[tuple[int, int], str] = {}
+        max_cols = 0
+
+        for row_index, tr in enumerate(row_elements):
+            while len(grid) <= row_index:
+                grid.append([])
+            col_index = 0
+            for cell in tr.xpath("./td|./th"):
+                while (row_index, col_index) in pending:
+                    grid[row_index].append(pending.pop((row_index, col_index)))
+                    col_index += 1
+                text = " ".join((cell.text_content() or "").split())
+                try:
+                    colspan = max(1, int(cell.get("colspan", 1)))
+                except (TypeError, ValueError):
+                    colspan = 1
+                try:
+                    rowspan = max(1, int(cell.get("rowspan", 1)))
+                except (TypeError, ValueError):
+                    rowspan = 1
+                for span_col in range(colspan):
+                    grid[row_index].append(text)
+                    for span_row in range(1, rowspan):
+                        pending[(row_index + span_row, col_index + span_col)] = text
+                    col_index += 1
+            while (row_index, col_index) in pending:
+                grid[row_index].append(pending.pop((row_index, col_index)))
+                col_index += 1
+            max_cols = max(max_cols, len(grid[row_index]))
+
+        if max_cols == 0:
+            return None
+        for row in grid:
+            row.extend([""] * (max_cols - len(row)))
+        return grid
+
+    @classmethod
+    def _html_table_to_dataframe(cls, html_fragment: str) -> Optional[pd.DataFrame]:
+        """Grid (see `_html_table_to_grid`) -> DataFrame, first row as header."""
+        grid = cls._html_table_to_grid(html_fragment)
+        if not grid:
+            return None
+        headers, body = grid[0], grid[1:]
+        return cls._grid_to_dataframe(headers, body)
+
+    def _parse_html_response(self, raw_text: str) -> List[pd.DataFrame]:
+        """Parse every `<table>` fragment in the response into DataFrames."""
+        fragments = self._extract_html_tables(raw_text)
+        dataframes: List[pd.DataFrame] = []
+        for fragment in fragments:
+            df = self._html_table_to_dataframe(fragment)
+            if df is not None:
+                dataframes.append(df)
+        return dataframes
+
+    # ------------------------------------------------------------------
+    # Robust JSON parsing (fallback path, for models that ignore the HTML
+    # instruction and answer in JSON anyway -- see `_JSON_FALLBACK_HINT`)
     # ------------------------------------------------------------------
     @staticmethod
     def _strip_markdown_fences(text: str) -> str:
@@ -373,10 +506,9 @@ class VLMTableExtractor:
             try:
                 return json.loads(candidate[obj_start : obj_end + 1])
             except (json.JSONDecodeError, TypeError) as exc:
-                logger.warning("VLM response was not valid JSON (%s). Raw: %.200s", exc, raw_text)
+                logger.debug("JSON fallback parse also failed (%s).", exc)
                 return None
 
-        logger.warning("VLM response was not valid JSON. Raw: %.200s", raw_text)
         return None
 
     @staticmethod
@@ -518,12 +650,15 @@ class VLMTableExtractor:
     # ------------------------------------------------------------------
     def extract_tables_from_image(self, image: Image.Image) -> List[pd.DataFrame]:
         """
-        Run the full single-page pipeline: inference -> JSON parse -> DataFrame(s).
+        Run the full single-page pipeline: inference -> parse -> DataFrame(s).
 
-        Returns an empty list (never raises) if the page had no table, or if
-        the VLM's output could not be parsed -- callers should treat that as
-        "skip this page" rather than a fatal error. One page may yield
-        multiple tables when several distinct grids are present.
+        Tries HTML `<table>` parsing first (the primary prompt format), then
+        falls back to the generic JSON grid shapes for models/checkpoints
+        that answer in JSON despite the instruction. Returns an empty list
+        (never raises) if the page had no table or nothing could be parsed
+        -- callers should treat that as "skip this page", not a fatal error.
+        One page may yield multiple tables when several distinct grids are
+        present.
         """
         try:
             raw_text = self._run_inference(image)
@@ -531,11 +666,21 @@ class VLMTableExtractor:
             logger.warning("VLM inference failed on a page: %s", exc)
             return []
 
-        payload = self._parse_json_response(raw_text)
-        if payload is None:
-            return []
+        html_tables = self._parse_html_response(raw_text)
+        if html_tables:
+            return html_tables
 
-        return self._payload_to_dataframes(payload)
+        payload = self._parse_json_response(raw_text)
+        if payload is not None:
+            json_tables = self._payload_to_dataframes(payload)
+            if json_tables:
+                return json_tables
+
+        logger.warning(
+            "VLM response had no parseable HTML or JSON table. Raw response (first 500 chars): %.500s",
+            raw_text,
+        )
+        return []
 
     def extract_table_from_image(self, image: Image.Image) -> Optional[pd.DataFrame]:
         """Backward-compatible wrapper: first table on the page, or None."""
@@ -571,7 +716,12 @@ class VLMTableExtractor:
         pdf_path = Path(pdf_path)
 
         try:
-            page_images = render_pdf_to_images(pdf_path, dpi=self.config.render_dpi, page_indices=page_indices)
+            page_images = render_pdf_to_images(
+                pdf_path,
+                dpi=self.config.render_dpi,
+                page_indices=page_indices,
+                crop_to_table=self.config.crop_to_table,
+            )
         except FileNotFoundError:
             raise
         except Exception as exc:

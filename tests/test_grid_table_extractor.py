@@ -20,6 +20,7 @@ import fitz  # PyMuPDF
 from pdf_extractor.grid_table_extractor import (
     detect_table_pages,
     extract_pdf_tables_to_excel,
+    find_table_bbox,
     page_looks_like_scanned_table,
 )
 from pdf_extractor.ocr_cleanup import clean_ocr_errors
@@ -123,6 +124,36 @@ class TestDetectTablePages(unittest.TestCase):
 
             pages_with_fallback = detect_table_pages(pdf_path, use_visual_fallback=True)
             self.assertEqual(pages_with_fallback, [0])
+
+
+class TestFindTableBbox(unittest.TestCase):
+    def test_returns_none_when_no_grid(self) -> None:
+        with TemporaryDirectory() as tmp:
+            pdf_path = Path(tmp) / "no_table.pdf"
+            make_plain_text_pdf(pdf_path)
+            self.assertIsNone(find_table_bbox(pdf_path, 0))
+
+    def test_bbox_covers_table_region_only(self) -> None:
+        with TemporaryDirectory() as tmp:
+            pdf_path = Path(tmp) / "scanned_table.pdf"
+            make_scanned_table_pdf(pdf_path)
+
+            bbox = find_table_bbox(pdf_path, 0)
+            self.assertIsNotNone(bbox)
+            x0, y0, x1, y1 = bbox
+
+            doc = fitz.open(str(pdf_path))
+            page_w, page_h = doc[0].rect.width, doc[0].rect.height
+            doc.close()
+
+            # Table occupies most, but not necessarily all, of the page --
+            # bbox must stay within page bounds and be a real sub-region.
+            self.assertGreaterEqual(x0, 0)
+            self.assertGreaterEqual(y0, 0)
+            self.assertLessEqual(x1, page_w)
+            self.assertLessEqual(y1, page_h)
+            self.assertGreater(x1, x0)
+            self.assertGreater(y1, y0)
 
 
 class TestExtractPdfTablesToExcel(unittest.TestCase):
