@@ -8,7 +8,12 @@ from tempfile import TemporaryDirectory
 
 import pandas as pd
 
-from pdf_extractor.exporters import compose_document_txt, resolve_output_path, save_unified_txt
+from pdf_extractor.exporters import (
+    compose_document_txt,
+    dataframe_to_plaintext_table,
+    resolve_output_path,
+    save_unified_txt,
+)
 
 
 SAMPLE_MD = """# Report
@@ -58,6 +63,13 @@ class TestResolveOutputPath(unittest.TestCase):
             p = resolve_output_path(Path(tmp) / "folder")
             self.assertEqual(p.name, "output.txt")
             self.assertEqual(p.parent.name, "folder")
+
+
+class TestDataframeToPlaintextTable(unittest.TestCase):
+    def test_omits_generic_header_row(self) -> None:
+        df = pd.DataFrame([["1", "value"]], columns=["col", "col_1"])
+        txt = dataframe_to_plaintext_table(df)
+        self.assertEqual(txt, "1\tvalue")
 
 
 class TestSaveUnifiedTxt(unittest.TestCase):

@@ -75,6 +75,39 @@ class TestMarkdownBlockParser(unittest.TestCase):
         self.assertIn("Intro paragraph", blocks[0].content)
         self.assertEqual(blocks[1].content.iloc[0]["Name"], "Alice")
 
+    def test_separator_line_does_not_start_duplicate_table(self) -> None:
+        markdown = """| A | B |
+|---|---|
+| 1 | 2 |
+"""
+        blocks = self.parser.parse_blocks(markdown)
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0].kind, "table")
+        self.assertEqual(len(blocks[0].content), 1)
+
+    def test_headerless_continuation_table_synthesizes_columns(self) -> None:
+        markdown = """| 1.3.2 | Thu tài sản khẩn cấp tạm thời |   |   |
+|------|----------------------------------|---|---|
+| 2 | Các khoản thi hành án theo đơn | | |
+"""
+        result = self.parser.parse(markdown)
+        self.assertEqual(len(result.tables), 1)
+        table = result.tables[0]
+        self.assertEqual(list(table.columns), ["col", "col_1", "col_2", "col_3"])
+        self.assertEqual(table.iloc[0]["col"], "1.3.2")
+        self.assertIn("Thu tài sản", table.iloc[0]["col_1"])
+
+    def test_noise_legend_row_is_filtered(self) -> None:
+        markdown = """| Số | Nội dung | Giá trị |
+|-----|----------|---------|
+| A | B | C |
+| 1 | Thu án phí | 10.000 |
+"""
+        result = self.parser.parse(markdown)
+        table = result.tables[0]
+        self.assertEqual(len(table), 1)
+        self.assertEqual(table.iloc[0]["Số"], "1")
+
 
 if __name__ == "__main__":
     unittest.main()

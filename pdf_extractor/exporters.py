@@ -118,7 +118,10 @@ def dataframe_to_plaintext_table(df: pd.DataFrame) -> str:
         return s.replace("\n", " ").replace("<br>", " ").replace("<br/>", " ").replace("\t", " ")
 
     columns = [_clean(str(c)) for c in df.columns]
-    lines = ["\t".join(columns)]
+    generic_header = all(re.fullmatch(r"col(?:_\d+)?", col) for col in columns)
+    lines: list[str] = []
+    if not generic_header:
+        lines.append("\t".join(columns))
     for row_idx in range(len(df)):
         cells = [_clean(str(df.iloc[row_idx, col_idx])) for col_idx in range(len(df.columns))]
         lines.append("\t".join(cells))

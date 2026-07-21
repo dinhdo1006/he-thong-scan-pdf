@@ -139,9 +139,13 @@ class MarkdownBlockParser:
         if not PIPE_RE.search(line):
             return False
 
-        # Case: current line IS the separator (malformed but possible)
+        # Do not treat a separator line as a fresh table start when it is
+        # merely the second line of a normal Markdown table.
         if SEPARATOR_RE.match(line):
-            return True
+            prev_has_pipe = index > 0 and PIPE_RE.search(lines[index - 1])
+            if prev_has_pipe:
+                return False
+            return index + 1 < len(lines) and self._is_table_row(lines[index + 1])
 
         # Case: classic GFM — header row, then separator on next line
         if index + 1 < len(lines) and SEPARATOR_RE.match(lines[index + 1]):
@@ -201,6 +205,79 @@ class MarkdownBlockParser:
     def _is_separator_row(self, line: str) -> bool:
         return bool(SEPARATOR_RE.match(line))
 
+    @staticmethod
+    def _looks_like_headerless_data_row(cells: list[str]) -> bool:
+        """
+        Heuristic for a table block whose first visible row is already data,
+        not a true header row.
+
+        Typical case on scanned forms: first cell is an item number like
+        `1.3.2` / `II`, second cell is a long description, remaining cells are
+        mostly empty or short symbols. We should keep this row as data and
+        synthesize generic column names instead of gluing it into the header.
+        """
+        if len(cells) < 2:
+            return False
+
+        first = cells[0].strip()
+        second = cells[1].strip()
+        if not first or not second:
+            return False
+
+        if not re.fullmatch(r"[\dIVXLCDM./⁄-]+", first, flags=re.IGNORECASE):
+            return False
+
+        if len(second) < 12:
+            return False
+
+        tail = cells[2:]
+        short_tail = sum(1 for cell in tail if len(cell.strip()) <= 3)
+        return short_tail >= max(1, len(tail) - 1)
+
+    @staticmethod
+    def _looks_like_noise_row(cells: list[str]) -> bool:
+        """
+        Drop OCR legend/noise rows such as `A | B | l | ẻ | 3 | + | 5 | 6 | Fị`.
+        They contain many tiny tokens and do not carry business data.
+        """
+        non_empty = [cell.strip() for cell in cells if cell.strip()]
+        if len(non_empty) >= 3:
+            all_tiny = all(len(cell) <= 2 for cell in non_empty)
+            no_digits = all(not re.search(r"\d", cell) for cell in non_empty)
+            if all_tiny and no_digits:
+                return True
+        if len(non_empty) < 4:
+            return False
+        tiny = sum(1 for cell in non_empty if len(cell) <= 2)
+        long_text = sum(1 for cell in non_empty if len(cell) >= 8)
+        return tiny >= max(4, len(non_empty) - 1) and long_text == 0
+
+    @staticmethod
+    def _looks_like_subheader_row(cells: list[str], n_cols: int) -> bool:
+        """
+        Detect header continuation rows placed below the separator.
+
+        Common OCR pattern: first 2-3 identifier columns are blank, while
+        later columns hold labels such as `Ủy thác`, `THA`, `Đình chỉ`.
+        """
+        padded = (cells + [""] * n_cols)[:n_cols]
+        leading_blank = sum(1 for cell in padded[:3] if not cell.strip())
+        later_non_empty = sum(1 for cell in padded[3:] if cell.strip())
+        has_long_label = any(len(cell.strip()) >= 3 for cell in padded[3:] if cell.strip())
+        return leading_blank >= 2 and later_non_empty >= 2 and has_long_label
+
+    @staticmethod
+    def _clean_header_cell(cell: str) -> str:
+        cell = cell.replace("<br>", " ").replace("<br/>", " ").replace("<br />", " ")
+        cell = " ".join(cell.split())
+        if not cell:
+            return ""
+
+        generic_markers = {"col", "col_1", "col_2", "col_3", "col_4"}
+        if cell.lower() in generic_markers:
+            return ""
+        return cell
+
     # ------------------------------------------------------------------
     # Header-merging helpers
     # ------------------------------------------------------------------
@@ -229,7 +306,7 @@ class MarkdownBlockParser:
             parts: list[str] = []
             for row in header_rows:
                 cell = row[col_idx] if col_idx < len(row) else ""
-                cell = cell.replace("<br>", " ").replace("<br/>", " ").replace("<br />", " ").strip()
+                cell = MarkdownBlockParser._clean_header_cell(cell)
                 if cell:
                     parts.append(cell)
             merged.append(" ".join(parts))
@@ -277,12 +354,27 @@ class MarkdownBlockParser:
         if n_cols == 0:
             return None
 
+        # Detect headerless continuation tables whose first visible row is
+        # already data (e.g. page-split continuations on scanned forms).
+        synthesized_header = False
+        if pre_sep and self._looks_like_headerless_data_row(pre_sep[0]):
+            post_sep.insert(0, pre_sep[0])
+            pre_sep = [[f"col_{i}" if i else "col" for i in range(n_cols)]]
+            synthesized_header = True
+
         # Absorb leading mostly-empty post-sep rows into the header group
         extra_header_rows: list[list[str]] = []
         data_rows: list[list[str]] = []
         real_started = False
         for row in post_sep:
-            if not real_started and self._is_mostly_empty_row(row, n_cols=n_cols):
+            if (
+                not synthesized_header
+                and not real_started
+                and (
+                    self._is_mostly_empty_row(row, n_cols=n_cols)
+                    or self._looks_like_subheader_row(row, n_cols=n_cols)
+                )
+            ):
                 extra_header_rows.append(row)
             else:
                 real_started = True
@@ -294,11 +386,20 @@ class MarkdownBlockParser:
         if not header:
             return None
 
+        if not synthesized_header:
+            header = [
+                header_cell if header_cell.strip() else (f"col_{idx}" if idx else "col")
+                for idx, header_cell in enumerate(header)
+            ]
+
         # Normalize data row widths
         normalized: list[list[str]] = []
         for row in data_rows:
             padded = list(row) + [""] * (n_cols - len(row))
-            normalized.append(padded[:n_cols])
+            padded = padded[:n_cols]
+            if self._looks_like_noise_row(padded):
+                continue
+            normalized.append(padded)
 
         # Ensure unique, non-blank column names
         seen: dict[str, int] = {}
