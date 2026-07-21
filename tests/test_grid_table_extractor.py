@@ -20,6 +20,7 @@ import fitz  # PyMuPDF
 from pdf_extractor.grid_table_extractor import (
     detect_table_pages,
     extract_pdf_tables_to_excel,
+    page_looks_like_scanned_table,
 )
 from pdf_extractor.ocr_cleanup import clean_ocr_errors
 import pandas as pd
@@ -53,6 +54,37 @@ def make_bordered_table_pdf(path: Path) -> None:
     doc.close()
 
 
+def make_scanned_table_pdf(path: Path) -> None:
+    """
+    Simulate a SCANNED page: rasterize a bordered table into a plain image,
+    then embed that image (and nothing else -- no vector rect/line objects)
+    on a fresh page. `page.find_tables()` cannot see this table at all; only
+    the pixel-based `page_looks_like_scanned_table` heuristic can.
+    """
+    vector_doc = fitz.open()
+    vector_page = vector_doc.new_page()
+    # Cover most of the page (both width and height), matching a real
+    # full-page scanned form -- a table confined to a small corner of the
+    # page has too low a line-density-relative-to-page-size to trip the
+    # heuristic, which is tuned for realistic full-page tables.
+    x0, y0, cell_w, cell_h = 40, 40, 100, 40
+    for row in range(18):
+        for col in range(5):
+            rect = fitz.Rect(
+                x0 + col * cell_w, y0 + row * cell_h, x0 + (col + 1) * cell_w, y0 + (row + 1) * cell_h
+            )
+            vector_page.draw_rect(rect, color=(0, 0, 0), width=1.5)
+    pix = vector_page.get_pixmap(dpi=150)
+    img_bytes = pix.tobytes("png")
+    vector_doc.close()
+
+    scanned_doc = fitz.open()
+    scanned_page = scanned_doc.new_page()
+    scanned_page.insert_image(scanned_page.rect, stream=img_bytes)
+    scanned_doc.save(str(path))
+    scanned_doc.close()
+
+
 def make_plain_text_pdf(path: Path) -> None:
     """A one-page PDF with prose only -- no ruled lines, no table."""
     doc = fitz.open()
@@ -76,6 +108,21 @@ class TestDetectTablePages(unittest.TestCase):
             make_plain_text_pdf(pdf_path)
             pages = detect_table_pages(pdf_path)
             self.assertEqual(pages, [])
+
+    def test_visual_fallback_finds_scanned_table(self) -> None:
+        """A scanned page has ZERO vector table objects; only the pixel-based
+        fallback can find it -- this is exactly the bug this heuristic fixes."""
+        with TemporaryDirectory() as tmp:
+            pdf_path = Path(tmp) / "scanned_table.pdf"
+            make_scanned_table_pdf(pdf_path)
+
+            self.assertTrue(page_looks_like_scanned_table(pdf_path, 0))
+
+            pages_without_fallback = detect_table_pages(pdf_path, use_visual_fallback=False)
+            self.assertEqual(pages_without_fallback, [])
+
+            pages_with_fallback = detect_table_pages(pdf_path, use_visual_fallback=True)
+            self.assertEqual(pages_with_fallback, [0])
 
 
 class TestExtractPdfTablesToExcel(unittest.TestCase):

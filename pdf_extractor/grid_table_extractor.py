@@ -38,6 +38,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import fitz  # PyMuPDF
+import numpy as np
 import pandas as pd
 import pdfplumber
 
@@ -189,9 +191,80 @@ def tables_to_dataframes(tables: List[RawTable], header_row: bool = True) -> Lis
     return [table_to_dataframe(t, header_row=header_row) for t in tables]
 
 
+# --- Visual (pixel-based) fallback: for SCANNED pages ------------------------
+# `page.find_tables()` above only ever sees VECTOR line/rect objects. A scanned
+# page (a photographed/scanned form flattened into one big embedded raster
+# image, which is extremely common for older government forms) has table
+# borders that are just printed PIXELS -- there is no vector object for
+# pdfplumber to find, so the structural scan above silently returns "no
+# table" even when a table is clearly visible to the human eye. The functions
+# below are a cheap, template-agnostic (no per-document config) heuristic
+# that renders the page and looks for a dense grid of horizontal + vertical
+# dark-pixel bands, so scanned documents aren't silently skipped.
+DEFAULT_VISUAL_DPI = 150
+DEFAULT_VISUAL_DARK_THRESHOLD = 180  # 0-255 grayscale; below this counts as "ink"
+DEFAULT_VISUAL_LINE_FRACTION = 0.2  # a row/column needs >= 20% ink to count as a candidate ruling
+DEFAULT_VISUAL_MIN_CLUSTERS = 5  # need this many distinct horizontal AND vertical bands to call it a grid
+
+
+def _render_page_grayscale(pdf_path: str | Path, page_index: int, dpi: int = DEFAULT_VISUAL_DPI) -> np.ndarray:
+    """Render one page to a 2D grayscale numpy array (0=black, 255=white) via PyMuPDF."""
+    doc = fitz.open(str(pdf_path))
+    try:
+        pix = doc[page_index].get_pixmap(dpi=dpi, colorspace=fitz.csGRAY)
+        return np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width)
+    finally:
+        doc.close()
+
+
+def _count_line_clusters(ink_fraction: np.ndarray, threshold: float, gap: int = 3) -> int:
+    """
+    Count distinct "bands" (runs of consecutive indices, merging gaps of up to
+    `gap` pixels) where `ink_fraction` exceeds `threshold`. A single thick
+    ruled line renders as several adjacent rows/columns above threshold --
+    this collapses that into ONE cluster, so cluster count roughly tracks
+    "how many ruling lines", not "how many pixels".
+    """
+    above = np.where(ink_fraction > threshold)[0]
+    if len(above) == 0:
+        return 0
+    clusters = 1
+    for prev, curr in zip(above, above[1:]):
+        if curr - prev > gap:
+            clusters += 1
+    return clusters
+
+
+def page_looks_like_scanned_table(
+    pdf_path: str | Path,
+    page_index: int,
+    dpi: int = DEFAULT_VISUAL_DPI,
+    dark_threshold: int = DEFAULT_VISUAL_DARK_THRESHOLD,
+    line_fraction: float = DEFAULT_VISUAL_LINE_FRACTION,
+    min_clusters: int = DEFAULT_VISUAL_MIN_CLUSTERS,
+) -> bool:
+    """
+    Pixel-based heuristic: does this page visually contain a dense ruled grid?
+
+    Used ONLY as a fallback when `find_tables()` (vector-based) finds nothing
+    anywhere in the document -- i.e. exactly the scanned/flattened-image case
+    it structurally cannot see. Trades perfect precision for not silently
+    skipping table extraction on scanned forms.
+    """
+    gray = _render_page_grayscale(pdf_path, page_index, dpi=dpi)
+    dark = gray < dark_threshold
+    height, width = dark.shape
+    row_ink_fraction = dark.sum(axis=1) / width
+    col_ink_fraction = dark.sum(axis=0) / height
+    horizontal_bands = _count_line_clusters(row_ink_fraction, line_fraction)
+    vertical_bands = _count_line_clusters(col_ink_fraction, line_fraction)
+    return horizontal_bands >= min_clusters and vertical_bands >= min_clusters
+
+
 def detect_table_pages(
     pdf_path: str | Path,
     table_settings: Dict[str, str] = DEFAULT_TABLE_SETTINGS,
+    use_visual_fallback: bool = True,
 ) -> List[int]:
     """
     Quick structural scan: which 0-based page indices physically contain >= 1 table.
@@ -205,6 +278,12 @@ def detect_table_pages(
     Args:
         pdf_path: Path to the PDF to scan.
         table_settings: Forwarded to pdfplumber's table detection.
+        use_visual_fallback: If the vector-based scan finds ZERO tables on
+            EVERY page (the telltale sign of a scanned/flattened document),
+            also run the cheap pixel-based `page_looks_like_scanned_table`
+            heuristic before giving up -- so scanned forms with real, visible
+            table borders aren't silently skipped just because pdfplumber has
+            no vector line objects to find.
 
     Returns:
         Sorted list of 0-based page indices that contain at least one
@@ -223,6 +302,18 @@ def detect_table_pages(
                 continue
             if found:
                 pages_with_tables.append(page_index)
+
+    if not pages_with_tables and use_visual_fallback and total_pages > 0:
+        logger.info(
+            "No vector-based tables found anywhere -- falling back to pixel-based "
+            "scan detection (likely a scanned/flattened document)."
+        )
+        for page_index in range(total_pages):
+            try:
+                if page_looks_like_scanned_table(pdf_path, page_index):
+                    pages_with_tables.append(page_index)
+            except Exception as exc:  # pragma: no cover - defensive: rendering failure
+                logger.warning("Visual table scan failed on page %d: %s", page_index + 1, exc)
 
     logger.info(
         "Table scan: %d/%d page(s) contain a physical table: %s",
