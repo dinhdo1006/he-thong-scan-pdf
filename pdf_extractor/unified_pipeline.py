@@ -248,6 +248,8 @@ class UnifiedPDFPipeline:
             logger.info(
                 "No tables detected anywhere in %s -- skipping table extraction (GPU untouched).", pdf_path
             )
+            # Marker is no longer needed for this document -- free VRAM.
+            self.marker.unload()
             export_tables_preview([], tables_path)
             return UnifiedResult(
                 text_path=text_path,
@@ -264,6 +266,7 @@ class UnifiedPDFPipeline:
                 "(VLM/PaddleOCR/grid) are NOT run.",
                 len(pages_with_tables),
             )
+            self.marker.unload()
             export_tables_preview([], tables_path)
             return UnifiedResult(
                 text_path=text_path,
@@ -273,6 +276,10 @@ class UnifiedPDFPipeline:
                 pages_with_tables=pages_with_tables,
                 table_backend_used=BACKEND_NONE,
             )
+
+        # Critical on 16 GiB cards: Marker + Qwen2-VL-7B cannot coexist in VRAM.
+        # Drop Marker BEFORE Step C loads the VLM.
+        self.marker.unload()
 
         dataframes, backend = self._extract_tables(pdf_path, out_dir, pages_with_tables)
         export_tables_preview(dataframes, tables_path)

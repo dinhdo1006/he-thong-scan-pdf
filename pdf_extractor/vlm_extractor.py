@@ -211,17 +211,46 @@ class VLMTableExtractor:
         # if the requested dtype string is invalid.
         dtype = getattr(torch, self.config.torch_dtype_name, torch.bfloat16)
 
+        # Clear leftover CUDA fragments (e.g. after Marker unload) before the
+        # large contiguous allocation that from_pretrained needs.
+        if self.config.device == "cuda":
+            torch.cuda.empty_cache()
+
+        free_gib = None
+        if self.config.device == "cuda":
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+            free_gib = free_bytes / (1024**3)
+            logger.info(
+                "GPU VRAM before VLM load: %.2f GiB free / %.2f GiB total",
+                free_gib,
+                total_bytes / (1024**3),
+            )
+
         logger.info(
             "Loading VLM '%s' on %s (dtype=%s)...",
             self.config.model_name,
             self.config.device,
             dtype,
         )
-        self._model = Qwen2VLForConditionalGeneration.from_pretrained(
-            self.config.model_name,
-            torch_dtype=dtype,
-            device_map=self.config.device,
-        )
+        try:
+            self._model = Qwen2VLForConditionalGeneration.from_pretrained(
+                self.config.model_name,
+                torch_dtype=dtype,
+                device_map=self.config.device,
+            )
+        except torch.OutOfMemoryError as exc:
+            hint = (
+                f" Only ~{free_gib:.1f} GiB free before load."
+                if free_gib is not None
+                else ""
+            )
+            raise VLMExtractionError(
+                "CUDA OOM while loading the VLM."
+                + hint
+                + " Kill other GPU processes (`nvidia-smi`, then `kill -9 <PID>`), "
+                "or use a smaller model e.g. --model Qwen/Qwen2-VL-2B-Instruct. "
+                f"Original error: {exc}"
+            ) from exc
         self._processor = AutoProcessor.from_pretrained(self.config.model_name)
         logger.info("VLM ready.")
 

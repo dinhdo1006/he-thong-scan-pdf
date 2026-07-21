@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import logging
 from pathlib import Path
 
@@ -10,6 +11,19 @@ logger = logging.getLogger(__name__)
 
 class MarkerExtractionError(Exception):
     """Raised when Marker fails to convert a PDF to Markdown."""
+
+
+def _free_cuda() -> None:
+    """Best-effort: release unused CUDA cache so the next model can allocate."""
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:  # pragma: no cover - optional dependency / no GPU
+        pass
+    gc.collect()
 
 
 class MarkerExtractor:
@@ -43,6 +57,21 @@ class MarkerExtractor:
             config={"use_llm": False},
         )
         logger.info("Marker models ready.")
+
+    def unload(self) -> None:
+        """
+        Drop Marker models from memory / VRAM.
+
+        Call this after text extraction finishes and BEFORE loading the VLM
+        (Qwen2-VL-7B alone needs ~14 GiB in bf16). Keeping both loaded on a
+        16 GiB card almost always OOMs.
+        """
+        if self._converter is None:
+            return
+        logger.info("Unloading Marker models to free VRAM for table extraction...")
+        self._converter = None
+        _free_cuda()
+        logger.info("Marker models unloaded.")
 
     def extract_markdown(self, pdf_path: str | Path) -> str:
         """
