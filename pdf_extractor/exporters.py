@@ -43,17 +43,84 @@ def _markdown_text_to_plain(text: str) -> str:
     return "\n".join(lines).strip()
 
 
+def _split_multi_value_cells(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Post-process a Marker-fallback DataFrame where one cell contains two
+    formatted-number values separated by spaces (e.g. "10.620.000   10.370.000").
+
+    For each column, if the column contains ANY cell that looks like
+    "NUMBER  NUMBER" (2+ whitespace-separated number-like tokens), the
+    column is replaced by two sub-columns named "col" and "col_2".
+    Generic: no column-name or template assumption.
+    """
+    NUMBER_LIKE = re.compile(r"^[\d.,]+$")
+
+    def _try_split(cell: str) -> list[str] | None:
+        """Return [part1, part2, ...] if cell is 2+ number tokens, else None."""
+        parts = cell.strip().split()
+        if len(parts) >= 2 and all(NUMBER_LIKE.match(p) for p in parts):
+            return parts
+        return None
+
+    rows = len(df)
+    new_cols: list[str] = []
+    column_data: list[list[str]] = []
+
+    # Iterate by position to avoid duplicate-column issues with df[name]
+    for col_pos, col in enumerate(df.columns):
+        raw: list[str] = [str(v) for v in df.iloc[:, col_pos]]
+        splits: list[list[str] | None] = [_try_split(v) for v in raw]
+        max_parts = max((len(s) for s in splits if s is not None), default=1)
+
+        if max_parts >= 2:
+            for part_idx in range(max_parts):
+                if part_idx == 0:
+                    sub = col
+                else:
+                    # Ensure the generated name is unique across ALL columns
+                    candidate = f"{col}_{part_idx + 1}"
+                    suffix = part_idx + 1
+                    while candidate in new_cols:
+                        suffix += 1
+                        candidate = f"{col}_{suffix}"
+                    sub = candidate
+                new_cols.append(sub)
+                col_vals: list[str] = []
+                for i in range(rows):
+                    s = splits[i]
+                    if s is not None and part_idx < len(s):
+                        col_vals.append(s[part_idx])
+                    elif s is None and part_idx == 0:
+                        col_vals.append(raw[i])
+                    else:
+                        col_vals.append("")
+                column_data.append(col_vals)
+        else:
+            new_cols.append(col)
+            column_data.append(raw)
+
+    # Build using a list-of-lists to avoid duplicate-column confusion
+    result = pd.DataFrame(dict(enumerate(column_data)))
+    result.columns = pd.Index(new_cols)
+    return result
+
+
 def dataframe_to_plaintext_table(df: pd.DataFrame) -> str:
-    """Render a DataFrame as a tab-separated plain-text grid."""
+    """Render a DataFrame as a tab-separated plain-text grid.
+
+    Uses positional (iloc) access to safely handle DataFrames with
+    duplicate column names.
+    """
     if df.empty or len(df.columns) == 0:
         return ""
-    columns = [str(c).replace("\n", " ").replace("<br>", " ").replace("<br/>", " ").replace("\t", " ") for c in df.columns]
+
+    def _clean(s: str) -> str:
+        return s.replace("\n", " ").replace("<br>", " ").replace("<br/>", " ").replace("\t", " ")
+
+    columns = [_clean(str(c)) for c in df.columns]
     lines = ["\t".join(columns)]
-    for _, row in df.iterrows():
-        cells = [
-            str(row[c]).replace("\n", " ").replace("<br>", " ").replace("<br/>", " ").replace("\t", " ")
-            for c in df.columns
-        ]
+    for row_idx in range(len(df)):
+        cells = [_clean(str(df.iloc[row_idx, col_idx])) for col_idx in range(len(df.columns))]
         lines.append("\t".join(cells))
     return "\n".join(lines)
 
@@ -89,6 +156,7 @@ def compose_document_txt(
 
         df = extracted_queue.pop(0) if extracted_queue else block.content
         assert isinstance(df, pd.DataFrame)
+        df = _split_multi_value_cells(df)
         if apply_ocr_cleanup:
             df = clean_ocr_errors(df)
         table_txt = dataframe_to_plaintext_table(df)
@@ -98,6 +166,7 @@ def compose_document_txt(
     # Rare: backend returned MORE tables than Marker blocks (e.g. stitched pages).
     while extracted_queue:
         df = extracted_queue.pop(0)
+        df = _split_multi_value_cells(df)
         if apply_ocr_cleanup:
             df = clean_ocr_errors(df)
         table_txt = dataframe_to_plaintext_table(df)

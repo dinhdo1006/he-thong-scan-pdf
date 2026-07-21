@@ -201,54 +201,115 @@ class MarkdownBlockParser:
     def _is_separator_row(self, line: str) -> bool:
         return bool(SEPARATOR_RE.match(line))
 
+    # ------------------------------------------------------------------
+    # Header-merging helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_mostly_empty_row(cells: list[str], empty_ratio: float = 0.6, n_cols: int = 0) -> bool:
+        """True when ≥ empty_ratio of cells (up to n_cols) are blank."""
+        width = n_cols if n_cols > 0 else len(cells)
+        if width == 0:
+            return True
+        padded = (cells + [""] * width)[:width]
+        empty = sum(1 for c in padded if not c.strip())
+        return empty / width >= empty_ratio
+
+    @staticmethod
+    def _merge_header_rows(header_rows: list[list[str]], n_cols: int = 0) -> list[str]:
+        """
+        Collapse multiple header rows into one by joining non-empty parts
+        per column with a space. Cleans up <br> tags, extra whitespace.
+        """
+        if not header_rows:
+            return []
+        width = n_cols if n_cols > 0 else max(len(r) for r in header_rows)
+        merged: list[str] = []
+        for col_idx in range(width):
+            parts: list[str] = []
+            for row in header_rows:
+                cell = row[col_idx] if col_idx < len(row) else ""
+                cell = cell.replace("<br>", " ").replace("<br/>", " ").replace("<br />", " ").strip()
+                if cell:
+                    parts.append(cell)
+            merged.append(" ".join(parts))
+        return merged
+
     def _table_lines_to_dataframe(
         self, table_lines: list[str]
     ) -> pd.DataFrame | None:
         """
         Convert a list of Markdown table lines into a pandas DataFrame.
 
-        First non-separator row → header.
-        Separator rows are discarded.
-        Remaining rows → data.
+        Strategy for Marker's complex multi-row headers:
+        1. The row(s) BEFORE the `---` separator are merged column-by-column
+           into a single header (join non-empty parts with a space).
+        2. After the separator, any leading rows where ≥60% of cells are
+           empty are treated as sub-header rows and also merged into the
+           header (Marker puts sub-header continuation rows in the data area).
+        3. The first "real" data row is the first post-separator row that
+           has <60% empty cells.
+        4. Column names are always made unique and never blank.
         """
         if not table_lines:
             return None
 
-        data_rows: list[list[str]] = []
-        header: list[str] | None = None
+        pre_sep: list[list[str]] = []
+        post_sep: list[list[str]] = []
+        found_sep = False
 
         for line in table_lines:
             if self._is_separator_row(line):
+                found_sep = True
                 continue
             cells = self._split_row(line)
-            if header is None:
-                header = cells
+            if not found_sep:
+                pre_sep.append(cells)
             else:
-                data_rows.append(cells)
+                post_sep.append(cells)
 
-        if header is None:
+        if not pre_sep and not post_sep:
             return None
 
-        # Normalize column count across rows (pad / truncate)
-        n_cols = len(header)
+        # Determine column width from the widest row seen
+        all_rows = pre_sep + post_sep
+        n_cols = max((len(r) for r in all_rows), default=0)
+        if n_cols == 0:
+            return None
+
+        # Absorb leading mostly-empty post-sep rows into the header group
+        extra_header_rows: list[list[str]] = []
+        data_rows: list[list[str]] = []
+        real_started = False
+        for row in post_sep:
+            if not real_started and self._is_mostly_empty_row(row, n_cols=n_cols):
+                extra_header_rows.append(row)
+            else:
+                real_started = True
+                data_rows.append(row)
+
+        all_header_rows = pre_sep + extra_header_rows
+        header = self._merge_header_rows(all_header_rows, n_cols=n_cols)
+
+        if not header:
+            return None
+
+        # Normalize data row widths
         normalized: list[list[str]] = []
         for row in data_rows:
-            if len(row) < n_cols:
-                row = row + [""] * (n_cols - len(row))
-            elif len(row) > n_cols:
-                row = row[:n_cols]
-            normalized.append(row)
+            padded = list(row) + [""] * (n_cols - len(row))
+            normalized.append(padded[:n_cols])
 
-        # Ensure unique column names for Excel safety
+        # Ensure unique, non-blank column names
         seen: dict[str, int] = {}
-        unique_header: list[str] = []
+        unique_cols: list[str] = []
         for col in header:
-            name = col if col else "col"
-            if name in seen:
-                seen[name] += 1
-                unique_header.append(f"{name}_{seen[name]}")
-            else:
+            name = col.strip() if col.strip() else "col"
+            if name not in seen:
                 seen[name] = 0
-                unique_header.append(name)
+                unique_cols.append(name)
+            else:
+                seen[name] += 1
+                unique_cols.append(f"{name}_{seen[name]}")
 
-        return pd.DataFrame(normalized, columns=unique_header)
+        return pd.DataFrame(normalized, columns=unique_cols)
