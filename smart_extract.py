@@ -60,6 +60,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if choice == PipelineChoice.VLM_TABLE and dataframes is not None:
         print(f"Done. Exported {len(dataframes)} table(s) to {args.output}")
+        stem = Path(args.output).stem
+        out_dir = Path(args.output).parent
+        print(f"  Preview (VS Code): {out_dir / (stem + '_preview.md')}")
+        print(f"  CSV:               {out_dir / (stem + '_table_1.csv')} ...")
+        print(f"  Excel:             {args.output}  (mở bằng LibreOffice/Excel)")
 
     return 0
 

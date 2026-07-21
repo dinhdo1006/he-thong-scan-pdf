@@ -45,6 +45,7 @@ from typing import Any, List, Optional
 import pandas as pd
 from PIL import Image
 
+from .exporters import export_tables_preview
 from .ocr_cleanup import clean_ocr_errors
 
 logger = logging.getLogger(__name__)
@@ -400,28 +401,13 @@ class VLMTableExtractor:
     @staticmethod
     def export_to_excel(dataframes: List[pd.DataFrame], output_path: str | Path) -> Path:
         """
-        Write every recovered table to its own sheet in one .xlsx workbook.
+        Write Excel + CSV + Markdown preview (VS Code-friendly companions).
 
-        Writes a placeholder workbook (instead of raising) when no tables
-        were found, so callers always get a valid file to point users at.
+        Prefer opening `*_preview.md` or `*_table_*.csv` in VS Code;
+        open `.xlsx` with LibreOffice / Excel.
         """
-        output_path = Path(output_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        if not dataframes:
-            pd.DataFrame({"info": ["No tables were extracted by the VLM in this document."]}).to_excel(
-                output_path, index=False, sheet_name="Info", engine="openpyxl"
-            )
-            logger.warning("No tables extracted -- wrote placeholder workbook to %s", output_path)
-            return output_path
-
-        with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-            for i, df in enumerate(dataframes, start=1):
-                sheet_name = f"Table_{i}"[:31]  # Excel hard-limits sheet names to 31 chars
-                df.to_excel(writer, index=False, sheet_name=sheet_name)
-
-        logger.info("Exported %d table(s) to %s", len(dataframes), output_path)
-        return output_path
+        written = export_tables_preview(dataframes, output_path)
+        return written["xlsx"]
 
 
 # ---------------------------------------------------------------------------
