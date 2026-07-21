@@ -109,9 +109,13 @@ class VLMConfig:
 # ---------------------------------------------------------------------------
 # PDF -> Image rendering
 # ---------------------------------------------------------------------------
-def render_pdf_to_images(pdf_path: str | Path, dpi: int = 300) -> List[Image.Image]:
+def render_pdf_to_images(
+    pdf_path: str | Path,
+    dpi: int = 300,
+    page_indices: Optional[List[int]] = None,
+) -> List[Image.Image]:
     """
-    Rasterize every page of a PDF into a high-resolution PIL Image.
+    Rasterize specific pages (or all pages) of a PDF into high-resolution PIL Images.
 
     Uses PyMuPDF (`fitz`) rather than `pdf2image` so no external Poppler
     binary needs to be installed on the GPU server -- swap this out for
@@ -122,9 +126,14 @@ def render_pdf_to_images(pdf_path: str | Path, dpi: int = 300) -> List[Image.Ima
         pdf_path: Path to the input PDF.
         dpi: Rendering resolution. VLMs benefit from higher resolution than
             classic OCR (300 DPI is a good default for dense tables).
+        page_indices: Optional list of 0-based page indices to render. If
+            `None` (default), every page is rendered. Restricting this to a
+            small subset (e.g. only pages a cheap pdfplumber scan flagged as
+            containing a table) is what lets the orchestrator avoid wasting
+            GPU time on pages that are pure prose.
 
     Returns:
-        One PIL.Image (RGB) per page, in page order.
+        One PIL.Image (RGB) per requested page, in page order.
     """
     import fitz  # PyMuPDF
 
@@ -138,14 +147,16 @@ def render_pdf_to_images(pdf_path: str | Path, dpi: int = 300) -> List[Image.Ima
     images: List[Image.Image] = []
     doc = fitz.open(pdf_path)
     try:
-        for page in doc:
+        indices = page_indices if page_indices is not None else range(doc.page_count)
+        for i in indices:
+            page = doc[i]
             pix = page.get_pixmap(matrix=matrix, colorspace=fitz.csRGB)
             image = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
             images.append(image)
     finally:
         doc.close()
 
-    logger.info("Rendered %d page(s) from %s at %d DPI.", len(images), pdf_path, dpi)
+    logger.info("Rendered %d page(s) from %s at %d DPI (page_indices=%s).", len(images), pdf_path, dpi, page_indices)
     return images
 
 
@@ -351,6 +362,51 @@ class VLMTableExtractor:
 
         return self._to_dataframe(rows)
 
+    def extract_pages(
+        self,
+        pdf_path: str | Path,
+        page_indices: Optional[List[int]] = None,
+        apply_ocr_cleanup: bool = True,
+    ) -> List[pd.DataFrame]:
+        """
+        Extract tables from a specific subset of pages (0-based indices), in memory.
+
+        This is the method the content-driven orchestrator
+        (`unified_pipeline.py`) calls: it first uses a cheap `pdfplumber`
+        scan to find which pages physically contain a table, then passes
+        ONLY those page indices here -- the VLM never runs on pages that are
+        pure prose. Pass `page_indices=None` to process every page (used by
+        the standalone `extract()` / CLI entrypoint below).
+
+        Does NOT write any file -- callers own export (so the orchestrator
+        can combine results from multiple backends into one workbook).
+
+        Returns:
+            One cleaned DataFrame per requested page that yielded a usable
+            table (may be an empty list -- not an error condition on its own).
+        """
+        pdf_path = Path(pdf_path)
+
+        try:
+            page_images = render_pdf_to_images(pdf_path, dpi=self.config.render_dpi, page_indices=page_indices)
+        except FileNotFoundError:
+            raise
+        except Exception as exc:
+            raise VLMExtractionError(f"Failed to render '{pdf_path}' to images: {exc}") from exc
+
+        dataframes: List[pd.DataFrame] = []
+        for image in page_images:
+            df = self.extract_table_from_image(image)
+            if df is None or df.empty:
+                continue
+
+            if apply_ocr_cleanup:
+                df = clean_ocr_errors(df)
+
+            dataframes.append(df)
+
+        return dataframes
+
     def extract(
         self,
         pdf_path: str | Path,
@@ -358,8 +414,11 @@ class VLMTableExtractor:
         apply_ocr_cleanup: bool = True,
     ) -> List[pd.DataFrame]:
         """
-        Full pipeline: PDF -> page images -> VLM JSON extraction -> DataFrames
-        -> OCR cleanup -> Excel export.
+        Full standalone pipeline: PDF -> every page -> VLM JSON extraction ->
+        DataFrames -> OCR cleanup -> Excel export.
+
+        For content-driven, page-restricted extraction (the orchestrator's
+        use case), call `extract_pages()` directly instead.
 
         Args:
             pdf_path: Path to the input PDF.
@@ -371,27 +430,7 @@ class VLMTableExtractor:
             One cleaned DataFrame per page that yielded a usable table (may
             be an empty list -- not an error condition on its own).
         """
-        pdf_path = Path(pdf_path)
-
-        try:
-            page_images = render_pdf_to_images(pdf_path, dpi=self.config.render_dpi)
-        except FileNotFoundError:
-            raise
-        except Exception as exc:
-            raise VLMExtractionError(f"Failed to render '{pdf_path}' to images: {exc}") from exc
-
-        dataframes: List[pd.DataFrame] = []
-        for page_index, image in enumerate(page_images):
-            df = self.extract_table_from_image(image)
-            if df is None or df.empty:
-                logger.info("Page %d: no usable table extracted -- skipping.", page_index + 1)
-                continue
-
-            if apply_ocr_cleanup:
-                df = clean_ocr_errors(df)
-
-            dataframes.append(df)
-
+        dataframes = self.extract_pages(pdf_path, page_indices=None, apply_ocr_cleanup=apply_ocr_cleanup)
         self.export_to_excel(dataframes, output_path)
         return dataframes
 

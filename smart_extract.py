@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 """
-CLI entrypoint: Smart Router for PDF extraction.
+CLI entrypoint: Unified, content-driven PDF pipeline.
 
-Classifies the input PDF (via `pdf_extractor.router.classify_pdf`) and dispatches
-to the correct extraction pipeline:
+Every input PDF goes through the SAME sequence, regardless of template,
+keyword, or filename:
+    1. Marker            -> general text (output_text.txt / output_markdown.md)
+    2. pdfplumber scan   -> which pages physically contain a table
+    3. If (and only if) step 2 found tables:
+         VLM (Qwen2-VL) -> PaddleOCR PP-Structure -> pdfplumber grid
+       (first backend that produces usable tables wins)
+       -> output_tables.xlsx (+ CSV / Markdown preview companions)
+    4. If step 2 found nothing anywhere, table extraction (and the GPU) is
+       skipped entirely.
 
-    - Keyword "Mẫu số: B06" found on page 1 -> local Vision-Language Model
-      table pipeline (Qwen2-VL running on CUDA, see vlm_extractor.py) + OCR
-      cleanup -> writes an .xlsx file (one sheet per table).
-    - Keyword not found -> generic Marker pipeline
-      (pdf_extractor.pipeline.PDFPipeline), which writes its own Markdown /
-      tables / text output files.
+No filename keyword, template name, or per-document configuration is used
+anywhere in this decision path.
 
 Usage:
-    python smart_extract.py --input path/to/file.pdf --output output_tables.xlsx
+    python smart_extract.py --input path/to/file.pdf --output-dir ./output
 """
 
 from __future__ import annotations
@@ -23,19 +27,19 @@ import logging
 import sys
 from pathlib import Path
 
-from pdf_extractor.router import PipelineChoice, classify_pdf, route_and_extract
+from pdf_extractor.unified_pipeline import UnifiedPDFPipeline
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Classify a PDF and route it to the correct extraction pipeline."
+        description="Content-driven PDF pipeline: text always, tables only if physically present."
     )
     parser.add_argument("--input", "-i", required=True, help="Path to the input PDF file.")
+    parser.add_argument("--output-dir", "-o", default="./output", help="Directory for output files.")
     parser.add_argument(
-        "--output",
-        "-o",
-        default="output_tables.xlsx",
-        help="Path to the output .xlsx file (only used if routed to the VLM pipeline).",
+        "--no-markdown",
+        action="store_true",
+        help="Do not save the intermediate Markdown file.",
     )
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging.")
     return parser
@@ -53,18 +57,29 @@ def main(argv: list[str] | None = None) -> int:
         logging.error("Input PDF not found: %s", pdf_path)
         return 1
 
-    choice = classify_pdf(pdf_path)
-    print(f"Router decision: {choice}")
+    try:
+        result = UnifiedPDFPipeline().run(
+            pdf_path,
+            output_dir=args.output_dir,
+            save_markdown=not args.no_markdown,
+        )
+    except Exception as exc:
+        logging.error("Pipeline failed: %s", exc)
+        return 1
 
-    dataframes = route_and_extract(pdf_path, output_path=args.output)
+    print("Done.")
+    print(f"  Text:                 {result.text_path}")
+    if result.markdown_path:
+        print(f"  Markdown:             {result.markdown_path}")
 
-    if choice == PipelineChoice.VLM_TABLE and dataframes is not None:
-        print(f"Done. Exported {len(dataframes)} table(s) to {args.output}")
-        stem = Path(args.output).stem
-        out_dir = Path(args.output).parent
-        print(f"  Preview (VS Code): {out_dir / (stem + '_preview.md')}")
-        print(f"  CSV:               {out_dir / (stem + '_table_1.csv')} ...")
-        print(f"  Excel:             {args.output}  (mở bằng LibreOffice/Excel)")
+    if result.pages_with_tables:
+        print(f"  Tables on page(s):    {[p + 1 for p in result.pages_with_tables]}")
+        print(f"  Backend used:         {result.table_backend_used}")
+        print(f"  Tables ({result.table_count}):           {result.tables_path}")
+        preview_path = result.tables_path.with_name(result.tables_path.stem + "_preview.md")
+        print(f"  Preview (VS Code):    {preview_path}")
+    else:
+        print("  No tables detected -- table extraction skipped (GPU untouched).")
 
     return 0
 

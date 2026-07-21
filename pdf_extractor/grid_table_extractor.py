@@ -41,7 +41,7 @@ from typing import Dict, List, Optional
 import pandas as pd
 import pdfplumber
 
-from .ocr_cleanup import DEFAULT_OCR_REPLACEMENTS, clean_ocr_errors
+from .ocr_cleanup import clean_ocr_errors
 
 logger = logging.getLogger(__name__)
 
@@ -189,6 +189,50 @@ def tables_to_dataframes(tables: List[RawTable], header_row: bool = True) -> Lis
     return [table_to_dataframe(t, header_row=header_row) for t in tables]
 
 
+def detect_table_pages(
+    pdf_path: str | Path,
+    table_settings: Dict[str, str] = DEFAULT_TABLE_SETTINGS,
+) -> List[int]:
+    """
+    Quick structural scan: which 0-based page indices physically contain >= 1 table.
+
+    Uses `page.find_tables()` -- structure/bbox detection only, no cell text
+    extraction -- so this is cheap to run on every page of every document
+    before deciding whether the (expensive) VLM/Paddle table pipeline is even
+    needed. This is the content-driven signal the orchestrator
+    (`unified_pipeline.py`) uses instead of any filename/keyword heuristic.
+
+    Args:
+        pdf_path: Path to the PDF to scan.
+        table_settings: Forwarded to pdfplumber's table detection.
+
+    Returns:
+        Sorted list of 0-based page indices that contain at least one
+        detected table. Empty list if the document has no tables at all
+        (or if it could not be opened/scanned -- callers should treat that
+        the same as "no tables found").
+    """
+    pages_with_tables: List[int] = []
+    with load_pdf(pdf_path) as pdf:
+        total_pages = len(pdf.pages)
+        for page_index, page in enumerate(pdf.pages):
+            try:
+                found = page.find_tables(table_settings=table_settings)
+            except Exception as exc:  # pragma: no cover - defensive: malformed page content
+                logger.warning("pdfplumber failed to scan page %d for tables: %s", page_index + 1, exc)
+                continue
+            if found:
+                pages_with_tables.append(page_index)
+
+    logger.info(
+        "Table scan: %d/%d page(s) contain a physical table: %s",
+        len(pages_with_tables),
+        total_pages,
+        [p + 1 for p in pages_with_tables],
+    )
+    return pages_with_tables
+
+
 def export_to_excel(
     dataframes: List[pd.DataFrame],
     output_path: str | Path,
@@ -226,21 +270,24 @@ def extract_pdf_tables_to_excel(
     output_path: str | Path = "output_grid_tables.xlsx",
     table_settings: Dict[str, str] = DEFAULT_TABLE_SETTINGS,
     header_row: bool = True,
-    ocr_replacements: Optional[Dict[str, str]] = DEFAULT_OCR_REPLACEMENTS,
+    apply_ocr_cleanup: bool = True,
 ) -> List[pd.DataFrame]:
     """
     Full pipeline: detect every bordered table -> DataFrame -> OCR cleanup -> Excel.
 
-    This is the single entrypoint most callers (including `router.py`) should use.
-    Pass `ocr_replacements=None` to skip the OCR post-processing pass entirely.
+    This is the single entrypoint most callers (including the fallback chain
+    in `unified_pipeline.py`) should use. `apply_ocr_cleanup=False` skips the
+    OCR post-processing pass entirely; when True (default), the wrong->right
+    mapping is loaded dynamically from `ocr_corrections.json` (see
+    `ocr_cleanup.py`) -- no dictionary is hardcoded here.
     """
     with load_pdf(pdf_path) as pdf:
         raw_tables = extract_raw_tables(pdf, table_settings=table_settings)
 
     dataframes = tables_to_dataframes(raw_tables, header_row=header_row)
 
-    if ocr_replacements:
-        dataframes = [clean_ocr_errors(df, ocr_replacements) for df in dataframes]
+    if apply_ocr_cleanup:
+        dataframes = [clean_ocr_errors(df) for df in dataframes]
 
     export_to_excel(dataframes, output_path)
     return dataframes
