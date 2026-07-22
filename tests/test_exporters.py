@@ -1,4 +1,4 @@
-"""Offline tests for unified plain-text export -- no GPU, no PDF needed."""
+"""Offline tests for unified plain-text / DOCX export -- no GPU, no PDF needed."""
 
 from __future__ import annotations
 
@@ -11,6 +11,8 @@ import pandas as pd
 from pdf_extractor.exporters import (
     compose_document_txt,
     dataframe_to_plaintext_table,
+    export_document,
+    export_document_from_markdown,
     merge_table_preserving_form,
     resolve_output_path,
     save_unified_txt,
@@ -46,6 +48,15 @@ Middle prose.
 End.
 """
 
+GARBLED_MD = """Header line.
+
+| hoyết Tình | Erở nh | col_3 |
+|------|-----|-----|
+| 1 | Thu | 10.000 |
+
+Footer.
+"""
+
 
 class TestComposeDocumentTxt(unittest.TestCase):
     def test_uses_extracted_table_when_available(self) -> None:
@@ -56,7 +67,6 @@ class TestComposeDocumentTxt(unittest.TestCase):
         self.assertIn("99", txt)
         self.assertIn("88", txt)
         self.assertNotIn("Alice", txt)
-        # Form-preserving pipe grid, not raw tabs.
         self.assertIn("|", txt)
 
     def test_falls_back_to_marker_table_when_extraction_empty(self) -> None:
@@ -75,7 +85,6 @@ class TestComposeDocumentTxt(unittest.TestCase):
         self.assertLess(table_pos, after_pos)
 
     def test_rejects_mismatched_extracted_table_keeps_marker_position(self) -> None:
-        """Wrong-shape VLM output must NOT FIFO-replace the Marker form."""
         wrong = [pd.DataFrame([["x", "y", "z", "w"]], columns=["A", "B", "C", "D"])]
         txt = compose_document_txt(SAMPLE_MD, wrong, apply_ocr_cleanup=False)
         self.assertIn("Alice", txt)
@@ -88,7 +97,6 @@ class TestComposeDocumentTxt(unittest.TestCase):
         self.assertLess(table_pos, after_pos)
 
     def test_matches_extracted_tables_by_shape_not_fifo_order(self) -> None:
-        """Second extracted table matches first Marker block when shapes align."""
         extracted = [
             pd.DataFrame([["Hue", "54"]], columns=["City", "Code"]),
             pd.DataFrame([["Bob", "40"]], columns=["Name", "Age"]),
@@ -110,17 +118,37 @@ class TestComposeDocumentTxt(unittest.TestCase):
         self.assertIn("99", txt)
         self.assertNotIn("orphan", txt)
 
+    def test_strips_markdown_image_placeholders(self) -> None:
+        md = """Prose before.
+
+![](_page_1_Picture_1.jpeg)
+
+Prose after.
+"""
+        txt = compose_document_txt(md, [], apply_ocr_cleanup=False)
+        self.assertIn("Prose before", txt)
+        self.assertIn("Prose after", txt)
+        self.assertNotIn("_page_1_Picture_1.jpeg", txt)
+        self.assertNotIn("![](", txt)
+
+    def test_garbled_marker_prefers_extracted_values(self) -> None:
+        extracted = [pd.DataFrame([["1", "Thu an phi", "10000"]], columns=["So", "Noi dung", "Tien"])]
+        txt = compose_document_txt(GARBLED_MD, extracted, apply_ocr_cleanup=False)
+        self.assertIn("Thu an phi", txt)
+        self.assertIn("10000", txt)
+        self.assertNotIn("hoyết", txt)
+
 
 class TestResolveOutputPath(unittest.TestCase):
     def test_file_path(self) -> None:
         with TemporaryDirectory() as tmp:
-            p = resolve_output_path(Path(tmp) / "out.txt")
-            self.assertEqual(p.name, "out.txt")
+            p = resolve_output_path(Path(tmp) / "out.docx")
+            self.assertEqual(p.name, "out.docx")
 
-    def test_directory_gets_default_filename(self) -> None:
+    def test_directory_gets_default_docx(self) -> None:
         with TemporaryDirectory() as tmp:
             p = resolve_output_path(Path(tmp) / "folder")
-            self.assertEqual(p.name, "output.txt")
+            self.assertEqual(p.name, "output.docx")
             self.assertEqual(p.parent.name, "folder")
 
 
@@ -140,9 +168,7 @@ class TestDataframeToPlaintextTable(unittest.TestCase):
         self.assertEqual(len(lines), 2)
         self.assertTrue(lines[0].startswith("|"))
         self.assertEqual(lines[0].count("|"), lines[1].count("|"))
-        # Empty "Ghi chu" cell is preserved as a blank slot between pipes.
         cells = [c.strip() for c in lines[1].split("|")]
-        # split("|") -> ['', '1.3.2', 'Thu tai san', '', '10.000', '']
         self.assertEqual(cells[3], "")
         self.assertEqual(cells[1], "1.3.2")
         self.assertEqual(cells[4], "10.000")
@@ -161,6 +187,53 @@ class TestMergeAndSimilarity(unittest.TestCase):
         merged = merge_table_preserving_form(marker, extracted)
         self.assertEqual(list(merged.columns), ["So", "Ten"])
         self.assertEqual(merged.iloc[0]["So"], "9")
+
+    def test_merge_prefers_extracted_when_marker_garbled(self) -> None:
+        marker = pd.DataFrame([["1", "x"]], columns=["hoyết Tình", "Erở nh"])
+        extracted = pd.DataFrame([["9", "y"]], columns=["So TT", "Noi dung"])
+        merged = merge_table_preserving_form(marker, extracted)
+        self.assertEqual(list(merged.columns), ["So TT", "Noi dung"])
+        self.assertEqual(merged.iloc[0]["So TT"], "9")
+
+
+class TestDocxExport(unittest.TestCase):
+    def test_ordered_docx_has_table_with_empty_cell(self) -> None:
+        from docx import Document
+
+        md = """Intro.
+
+| A | B | C |
+|---|---|---|
+| 1 |  | 3 |
+
+Outro.
+"""
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "out.docx"
+            export_document_from_markdown(md, [], path, apply_ocr_cleanup=False)
+            self.assertTrue(path.is_file())
+            doc = Document(str(path))
+            texts = [p.text for p in doc.paragraphs]
+            self.assertTrue(any("Intro" in t for t in texts))
+            self.assertTrue(any("Outro" in t for t in texts))
+            self.assertEqual(len(doc.tables), 1)
+            table = doc.tables[0]
+            # header + 1 data row
+            self.assertEqual(len(table.rows), 2)
+            self.assertEqual(len(table.columns), 3)
+            self.assertEqual(table.rows[1].cells[0].text, "1")
+            self.assertEqual(table.rows[1].cells[1].text, "")
+            self.assertEqual(table.rows[1].cells[2].text, "3")
+
+    def test_export_document_legacy_helper(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "legacy.docx"
+            export_document(
+                "Hello",
+                [pd.DataFrame([["a", ""]], columns=["X", "Y"])],
+                path,
+            )
+            self.assertTrue(path.is_file())
 
 
 class TestSaveUnifiedTxt(unittest.TestCase):

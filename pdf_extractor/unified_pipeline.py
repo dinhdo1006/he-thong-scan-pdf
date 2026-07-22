@@ -2,13 +2,14 @@
 Unified Generic Pipeline: content-driven orchestration for ANY input PDF.
 
 Every PDF goes through the same fixed sequence:
-    Step A (always):     Marker           -> document Markdown.
+    Step A (always):     Marker           -> document Markdown (prose + anchors).
     Step B (always):     pdfplumber scan  -> which pages contain a table.
     Step C (if B found): VLM -> PaddleOCR -> pdfplumber grid (first usable wins).
 
-Output: ONE plain-text `.txt` file only (prose + tables in reading order).
-If the GPU/ML table backends fail, Marker's table blocks are kept so content
-is never silently dropped.
+Primary output: form-faithful `.docx` (prose + real Word tables in reading order).
+Also writes: `output_tables.xlsx` and a companion `output.txt` for debugging.
+If GPU/ML table backends fail, Marker's table blocks are kept so content is
+never silently dropped.
 """
 
 from __future__ import annotations
@@ -20,7 +21,16 @@ from typing import List, Optional, Tuple
 
 import pandas as pd
 
-from .exporters import DEFAULT_OUTPUT_TXT, compose_document_txt, resolve_output_path, save_unified_txt
+from .exporters import (
+    DEFAULT_OUTPUT_DOCX,
+    DEFAULT_OUTPUT_TXT,
+    DEFAULT_OUTPUT_XLSX,
+    compose_document_txt,
+    export_document_from_markdown,
+    export_tables_preview,
+    resolve_output_path,
+    save_unified_txt,
+)
 from .grid_table_extractor import (
     DEFAULT_TABLE_SETTINGS,
     detect_table_pages,
@@ -50,6 +60,9 @@ class UnifiedResult:
     pages_with_tables: List[int] = field(default_factory=list)
     table_backend_used: str = BACKEND_NONE
     used_marker_table_fallback: bool = False
+    docx_path: Optional[Path] = None
+    xlsx_path: Optional[Path] = None
+    txt_path: Optional[Path] = None
 
 
 def _run_paddle_fallback(pdf_path: Path, out_dir: Path) -> List[pd.DataFrame]:
@@ -74,7 +87,7 @@ def _run_grid_fallback(pdf_path: Path, out_dir: Path, table_settings: dict) -> L
 
 
 class UnifiedPDFPipeline:
-    """Content-driven orchestrator producing a single `.txt` file."""
+    """Content-driven orchestrator producing form-faithful `.docx` (+ xlsx/txt)."""
 
     def __init__(
         self,
@@ -126,26 +139,42 @@ class UnifiedPDFPipeline:
     def run(
         self,
         pdf_path: str | Path,
-        output: str | Path = DEFAULT_OUTPUT_TXT,
+        output: str | Path = DEFAULT_OUTPUT_DOCX,
         *,
-        output_filename: str = DEFAULT_OUTPUT_TXT,
+        output_filename: str = DEFAULT_OUTPUT_DOCX,
         skip_tables: bool = False,
+        write_txt: bool = True,
+        write_xlsx: bool = True,
     ) -> UnifiedResult:
         """
-        Process one PDF and write a single `.txt` file.
+        Process one PDF and write form-faithful outputs.
 
         Args:
             pdf_path: Input PDF.
-            output: Output `.txt` path, or a directory (writes `output.txt` inside).
+            output: Output `.docx` path, or a directory (writes `output.docx` inside).
+                    Passing `.txt` still works (writes that txt as primary, plus docx sibling).
             output_filename: File name when `output` is a directory.
             skip_tables: Skip VLM/Paddle/grid (Marker text + Marker tables only).
+            write_txt: Also write companion `output.txt`.
+            write_xlsx: Also write `output_tables.xlsx` for structured tables.
         """
         pdf_path = Path(pdf_path)
         if not pdf_path.is_file():
             raise FileNotFoundError(f"PDF not found: {pdf_path}")
 
-        output_path = resolve_output_path(output, default_name=output_filename)
-        work_dir = output_path.parent
+        requested = Path(output).expanduser()
+        want_txt_primary = requested.suffix.lower() == ".txt"
+
+        if want_txt_primary:
+            txt_path = resolve_output_path(requested, default_name=DEFAULT_OUTPUT_TXT)
+            work_dir = txt_path.parent
+            docx_path = work_dir / DEFAULT_OUTPUT_DOCX
+        else:
+            docx_path = resolve_output_path(output, default_name=output_filename)
+            work_dir = docx_path.parent
+            txt_path = work_dir / DEFAULT_OUTPUT_TXT
+
+        xlsx_path = work_dir / DEFAULT_OUTPUT_XLSX
 
         markdown = self.marker.extract_markdown(pdf_path)
         pages_with_tables = self._detect_table_pages(pdf_path)
@@ -168,24 +197,39 @@ class UnifiedPDFPipeline:
             if not dataframes:
                 logger.error(
                     "Table page(s) %s detected but every backend returned zero tables. "
-                    "Falling back to Marker's table blocks in the final .txt.",
+                    "Falling back to Marker's table blocks in the final document.",
                     [p + 1 for p in pages_with_tables],
                 )
                 used_marker_fallback = True
                 backend = BACKEND_MARKER
 
-        txt_content = compose_document_txt(markdown, dataframes, apply_ocr_cleanup=True)
-        save_unified_txt(txt_content, output_path)
+        docx_path, final_tables = export_document_from_markdown(
+            markdown, dataframes, docx_path, apply_ocr_cleanup=True
+        )
+
+        written_xlsx: Optional[Path] = None
+        if write_xlsx:
+            written = export_tables_preview(final_tables, xlsx_path, write_csv=True, write_markdown=True)
+            written_xlsx = written["xlsx"]
+
+        written_txt: Optional[Path] = None
+        if write_txt or want_txt_primary:
+            txt_content = compose_document_txt(markdown, dataframes, apply_ocr_cleanup=True)
+            written_txt = save_unified_txt(txt_content, txt_path)
 
         marker_table_count = sum(1 for _ in MarkdownBlockParser().parse_blocks(markdown) if _.kind == "table")
-        table_count = len(dataframes) if dataframes else marker_table_count
+        table_count = len(final_tables) if final_tables else marker_table_count
 
+        primary = txt_path if want_txt_primary else docx_path
         return UnifiedResult(
-            output_path=output_path,
+            output_path=primary,
             table_count=table_count,
             pages_with_tables=pages_with_tables,
             table_backend_used=backend,
             used_marker_table_fallback=used_marker_fallback,
+            docx_path=docx_path,
+            xlsx_path=written_xlsx,
+            txt_path=written_txt,
         )
 
 
@@ -193,14 +237,14 @@ def _build_arg_parser():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Content-driven PDF pipeline -> single plain-text .txt output."
+        description="Content-driven PDF pipeline -> form-faithful .docx (+ xlsx/txt)."
     )
     parser.add_argument("--input", "-i", required=True, help="Path to the input PDF file.")
     parser.add_argument(
         "--output",
         "-o",
-        default=DEFAULT_OUTPUT_TXT,
-        help="Output .txt file path, or a directory (writes output.txt inside).",
+        default=DEFAULT_OUTPUT_DOCX,
+        help="Output .docx path, or a directory (writes output.docx inside).",
     )
     parser.add_argument(
         "--skip-tables",
@@ -227,7 +271,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
 
     print("Done.")
-    print(f"  Output:            {result.output_path}")
+    print(f"  DOCX:              {result.docx_path}")
+    if result.xlsx_path:
+        print(f"  Tables (xlsx):     {result.xlsx_path}")
+    if result.txt_path:
+        print(f"  Text (debug):      {result.txt_path}")
     if result.pages_with_tables:
         print(f"  Table page(s):     {[p + 1 for p in result.pages_with_tables]}")
         print(f"  Backend:           {result.table_backend_used}")

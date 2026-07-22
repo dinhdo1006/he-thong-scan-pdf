@@ -1,10 +1,12 @@
-"""Export parsed tables and text to plain-text (and optional debug formats)."""
+"""Export parsed tables and text to plain-text / Word (and optional debug formats)."""
 
 from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import pandas as pd
 
@@ -14,17 +16,26 @@ from .ocr_cleanup import clean_ocr_errors, clean_text_ocr_errors
 logger = logging.getLogger(__name__)
 
 DEFAULT_OUTPUT_TXT = "output.txt"
+DEFAULT_OUTPUT_DOCX = "output.docx"
+DEFAULT_OUTPUT_XLSX = "output_tables.xlsx"
+
+_MD_IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]+\)")
+_GARBLE_HINT_RE = re.compile(
+    r"hoyết|qhyết|Erở|ĐƑT|thăng\)|gôm cả|thí hãnh|ĐÓI CHIẾU",
+    re.IGNORECASE,
+)
 
 
-def resolve_output_path(output: str | Path, default_name: str = DEFAULT_OUTPUT_TXT) -> Path:
+def resolve_output_path(output: str | Path, default_name: str = DEFAULT_OUTPUT_DOCX) -> Path:
     """
-    Resolve CLI `-o` to a single `.txt` file path.
+    Resolve CLI `-o` to a concrete file path.
 
-    - `result.txt`           -> that file
-    - `./output` (directory) -> `./output/output.txt`
+    - `result.docx` / `result.txt` -> that file
+    - `./output` (directory)       -> `./output/<default_name>`
     """
     path = Path(output).expanduser()
-    if path.suffix.lower() == ".txt":
+    suffix = path.suffix.lower()
+    if suffix in {".txt", ".docx", ".xlsx"}:
         path.parent.mkdir(parents=True, exist_ok=True)
         return path.resolve()
     path.mkdir(parents=True, exist_ok=True)
@@ -32,15 +43,27 @@ def resolve_output_path(output: str | Path, default_name: str = DEFAULT_OUTPUT_T
 
 
 def _markdown_text_to_plain(text: str) -> str:
-    """Light cleanup: headings and inline HTML from Marker -> plain text."""
+    """Light cleanup: headings, images, and inline HTML from Marker -> plain text."""
     lines: list[str] = []
     for line in text.splitlines():
         stripped = line.strip()
-        if stripped.startswith("##"):
+        if not stripped:
+            lines.append("")
+            continue
+        # Drop Marker-emitted image placeholders (stamps/signatures as .jpeg).
+        if _MD_IMAGE_RE.search(stripped) and not _MD_IMAGE_RE.sub("", stripped).strip():
+            continue
+        stripped = _MD_IMAGE_RE.sub("", stripped)
+        if stripped.startswith("#"):
             stripped = re.sub(r"^#+\s*", "", stripped)
         stripped = stripped.replace("<br>", " ").replace("<br/>", " ").replace("<br />", " ")
-        lines.append(stripped)
-    return "\n".join(lines).strip()
+        stripped = stripped.strip()
+        if stripped:
+            lines.append(stripped)
+    # Collapse excess blank lines
+    body = "\n".join(lines)
+    body = re.sub(r"\n{3,}", "\n\n", body)
+    return body.strip()
 
 
 _GENERIC_HEADER_RE = re.compile(r"^(?:col(?:_\d+)?|Column_\d+)$", re.IGNORECASE)
@@ -189,29 +212,54 @@ def _slice_stitched_table(
     return sliced.reset_index(drop=True)
 
 
+def _headers_look_garbled(columns: list[str]) -> bool:
+    """Heuristic: Marker OCR headers that should not win over a clean backend grid."""
+    if not columns:
+        return True
+    joined = " ".join(columns)
+    if _GARBLE_HINT_RE.search(joined):
+        return True
+    # Many tiny / punctuation-heavy tokens → typical OCR header soup.
+    tokens = [t for t in re.findall(r"\S+", joined) if t]
+    if len(tokens) >= 4:
+        tiny = sum(1 for t in tokens if len(t) <= 2)
+        if tiny / len(tokens) >= 0.45:
+            return True
+    return False
+
+
 def merge_table_preserving_form(
     marker_df: pd.DataFrame,
     extracted_df: pd.DataFrame,
 ) -> pd.DataFrame:
     """
     Prefer extracted cell values when shapes align; keep Marker headers / width
-    when they better describe the printed form.
+    when they better describe the printed form. If Marker headers look
+    OCR-garbled, prefer extracted headers instead.
     """
     marker_cols = [_clean_cell_text(c) for c in marker_df.columns]
     extracted_cols = [_clean_cell_text(c) for c in extracted_df.columns]
 
-    # Same width: take extracted body, prefer real Marker headers over generic ones.
+    # Same width: take extracted body, choose the cleaner header set.
     if len(marker_cols) == len(extracted_cols) and len(marker_cols) > 0:
         body = [
             [_clean_cell_text(extracted_df.iloc[r, c]) for c in range(len(extracted_cols))]
             for r in range(len(extracted_df))
         ]
-        if _headers_are_generic(extracted_cols) and not _headers_are_generic(marker_cols):
-            headers = marker_cols
-        elif not _headers_are_generic(extracted_cols):
+        marker_garbled = _headers_look_garbled(marker_cols)
+        extracted_generic = _headers_are_generic(extracted_cols)
+        marker_generic = _headers_are_generic(marker_cols)
+
+        if marker_garbled and not extracted_generic:
             headers = extracted_cols
+        elif extracted_generic and not marker_generic and not marker_garbled:
+            headers = marker_cols
+        elif not extracted_generic:
+            headers = extracted_cols
+        elif not marker_generic and not marker_garbled:
+            headers = marker_cols
         else:
-            headers = marker_cols if marker_cols else extracted_cols
+            headers = extracted_cols if not extracted_generic else marker_cols
         return pd.DataFrame(body, columns=headers)
 
     # Extracted is narrower but Marker collapsed numbers into one cell — expand Marker.
@@ -219,7 +267,10 @@ def merge_table_preserving_form(
     if len(expanded_marker.columns) == len(extracted_cols):
         return merge_table_preserving_form(expanded_marker, extracted_df)
 
-    # Width mismatch: keep the wider grid (closer to printed form), fill from overlap.
+    # Width mismatch: prefer the extracted grid when Marker headers are garbled,
+    # otherwise keep the wider grid (closer to printed form).
+    if _headers_look_garbled(marker_cols):
+        return extracted_df.copy()
     if len(marker_cols) >= len(extracted_cols):
         return marker_df.copy()
     return extracted_df.copy()
@@ -325,41 +376,45 @@ def _prepare_table_df(df: pd.DataFrame, *, apply_ocr_cleanup: bool) -> pd.DataFr
     return prepared
 
 
-def compose_document_txt(
+@dataclass
+class AssembledBlock:
+    """One ordered document slice after table matching/merge."""
+
+    kind: Literal["text", "table"]
+    content: str | pd.DataFrame
+
+
+def assemble_document_blocks(
     markdown: str,
     extracted_tables: list[pd.DataFrame],
     *,
     apply_ocr_cleanup: bool = True,
-) -> str:
+) -> list[AssembledBlock]:
     """
-    Build ONE plain-text document from Marker Markdown + optional extracted tables.
+    Walk Marker blocks in reading order and produce final text/table slices.
 
-    Walks Markdown blocks in document reading order (this is what preserves
-    position). For each Marker table block:
-      1. pick the best-matching extracted table by shape/content score;
-      2. if score is too low, keep Marker's own grid (never FIFO-assign a wrong table);
-      3. if a stitched extracted table is taller than the block, slice by row count;
-      4. merge so form width/headers stay intact.
-
-    Leftover extracted tables that never matched are appended at the end only
-    when Marker had zero table blocks (otherwise they would break reading order).
+    Same matching rules as the plain-text composer: shape score, stitch slice,
+    merge preserving form. Shared by `.txt` and `.docx` exporters so position
+    stays consistent across formats.
     """
     blocks = MarkdownBlockParser().parse_blocks(markdown)
     candidates: list[pd.DataFrame | None] = list(extracted_tables)
     used_flags = [False] * len(candidates)
     row_cursors: dict[int, int] = {}
-    parts: list[str] = []
+    parts: list[AssembledBlock] = []
     marker_table_count = sum(1 for b in blocks if b.kind == "table")
     share_across_blocks = marker_table_count > 1
     seen_marker_tables = 0
 
+    # When Marker found no pipe-tables but backends returned grids (common on
+    # scans where Marker OCR fails), emit prose then append extracted tables.
     for block in blocks:
         if block.kind == "text":
             plain = _markdown_text_to_plain(str(block.content))
             if apply_ocr_cleanup:
                 plain = clean_text_ocr_errors(plain)
             if plain.strip():
-                parts.append(plain)
+                parts.append(AssembledBlock(kind="text", content=plain))
             continue
 
         seen_marker_tables += 1
@@ -367,6 +422,15 @@ def compose_document_txt(
         assert isinstance(marker_df, pd.DataFrame)
 
         pick = _pick_best_extracted_index(marker_df, candidates)
+        if pick is None and extracted_tables and _headers_look_garbled(
+            [_clean_cell_text(c) for c in marker_df.columns]
+        ):
+            # Garbled Marker header + unused extracted: take next unused by order.
+            for idx, cand in enumerate(candidates):
+                if cand is not None:
+                    pick = (idx, 0.5)
+                    break
+
         if pick is None:
             df = marker_df
             logger.debug(
@@ -390,37 +454,25 @@ def compose_document_txt(
             used_flags[idx] = True
             if sliced.empty:
                 df = marker_df
-                logger.debug(
-                    "Table block %d: extracted slice empty -- keeping Marker grid.",
-                    seen_marker_tables,
-                )
             else:
                 df = merge_table_preserving_form(marker_df, sliced)
                 logger.debug(
-                    "Table block %d: matched extracted[%d] score=%.2f marker=%s extracted_slice=%s -> %s",
+                    "Table block %d: matched extracted[%d] score=%.2f -> %s",
                     seen_marker_tables,
                     idx,
                     score,
-                    marker_df.shape,
-                    sliced.shape,
                     df.shape,
                 )
 
         df = _prepare_table_df(df, apply_ocr_cleanup=apply_ocr_cleanup)
-        table_txt = dataframe_to_plaintext_table(df)
-        if table_txt.strip():
-            parts.append(table_txt)
+        parts.append(AssembledBlock(kind="table", content=df))
 
-    # Only dump unmatched extracted tables when Marker found no table anchors —
-    # otherwise appending would move content out of its document position.
     if marker_table_count == 0:
         for cand in candidates:
             if cand is None:
                 continue
             df = _prepare_table_df(cand, apply_ocr_cleanup=apply_ocr_cleanup)
-            table_txt = dataframe_to_plaintext_table(df)
-            if table_txt.strip():
-                parts.append(table_txt)
+            parts.append(AssembledBlock(kind="table", content=df))
     else:
         leftover = sum(
             1 for flag, cand in zip(used_flags, candidates) if not flag and cand is not None
@@ -431,6 +483,27 @@ def compose_document_txt(
                 leftover,
             )
 
+    return parts
+
+
+def compose_document_txt(
+    markdown: str,
+    extracted_tables: list[pd.DataFrame],
+    *,
+    apply_ocr_cleanup: bool = True,
+) -> str:
+    """Build ONE plain-text document (prose + aligned pipe tables) in reading order."""
+    parts: list[str] = []
+    for block in assemble_document_blocks(
+        markdown, extracted_tables, apply_ocr_cleanup=apply_ocr_cleanup
+    ):
+        if block.kind == "text":
+            parts.append(str(block.content))
+        else:
+            assert isinstance(block.content, pd.DataFrame)
+            table_txt = dataframe_to_plaintext_table(block.content)
+            if table_txt.strip():
+                parts.append(table_txt)
     body = "\n\n".join(parts)
     return body.rstrip() + ("\n" if body.strip() else "")
 
@@ -551,29 +624,54 @@ class TableExporter:
         return written["xlsx"]
 
 
-def export_document(
-    text: str,
-    tables: list[pd.DataFrame],
+def _set_cell_text(cell, text: str, *, bold: bool = False) -> None:
+    """Write plain text into a python-docx cell, preserving empty strings."""
+    cell.text = ""
+    paragraph = cell.paragraphs[0]
+    run = paragraph.add_run(text)
+    run.bold = bold
+
+
+def _add_dataframe_as_word_table(doc, df: pd.DataFrame) -> None:
+    """Insert one form-faithful Word table from a DataFrame (empty cells kept)."""
+    if df is None or len(df.columns) == 0:
+        return
+
+    cols = [_clean_cell_text(c) for c in df.columns]
+    include_header = not _headers_are_generic(cols)
+    n_cols = len(cols)
+    n_body = len(df)
+    n_rows = n_body + (1 if include_header else 0)
+    if n_rows == 0:
+        # Header-only scaffold
+        n_rows = 1
+        include_header = True
+
+    table = doc.add_table(rows=n_rows, cols=n_cols)
+    table.style = "Table Grid"
+
+    row_offset = 0
+    if include_header:
+        for col_idx, name in enumerate(cols):
+            _set_cell_text(table.rows[0].cells[col_idx], name, bold=True)
+        row_offset = 1
+
+    for r in range(n_body):
+        for c in range(n_cols):
+            _set_cell_text(
+                table.rows[row_offset + r].cells[c],
+                _clean_cell_text(df.iloc[r, c]),
+            )
+
+
+def export_ordered_docx(
+    blocks: list[AssembledBlock],
     output_path: str | Path,
 ) -> Path:
     """
-    Assemble one readable Word (.docx) file from ALREADY-STRUCTURED data:
-    plain prose paragraphs + real Word tables (one `python-docx` table per
-    DataFrame, one cell per DataFrame cell).
+    Write a `.docx` with prose and Word tables in document reading order.
 
-    Deliberately NOT built by converting Marker's raw Markdown -- Marker's
-    own table guesses are unreliable on scanned/complex forms (merged cells,
-    OCR typos), so converting that Markdown to Word would just bake the same
-    mistakes into a different file format. This function only ever consumes:
-      - `text`: prose with tables already stripped out (see
-        `MarkdownBlockParser` / `unified_pipeline._extract_text`)
-      - `tables`: the DataFrames actually produced by the table-extraction
-        backend (VLM / PaddleOCR / pdfplumber grid), which is what carries a
-        real, verified column/row structure.
-
-    No layout reconstruction (merged header cells, stamp/signature
-    positioning, etc.) is attempted -- this produces a plain, readable
-    document: paragraphs, then each table as a normal Word table, in order.
+    Each table is a real `python-docx` grid (editable cells), not an image.
     """
     from docx import Document
 
@@ -581,47 +679,77 @@ def export_document(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     doc = Document()
+    table_count = 0
 
-    for paragraph in text.split("\n\n"):
-        stripped = paragraph.strip()
-        if not stripped:
+    for block in blocks:
+        if block.kind == "text":
+            text = str(block.content).strip()
+            if not text:
+                continue
+            for paragraph in text.split("\n\n"):
+                stripped = paragraph.strip()
+                if not stripped:
+                    continue
+                for line in stripped.splitlines():
+                    if line.strip():
+                        doc.add_paragraph(line.strip())
             continue
-        for line in stripped.splitlines():
-            if line.strip():
-                doc.add_paragraph(line.strip())
+
+        assert isinstance(block.content, pd.DataFrame)
+        df = block.content
+        if df is None or (df.empty and len(df.columns) == 0):
+            continue
+        _add_dataframe_as_word_table(doc, df)
+        table_count += 1
         doc.add_paragraph("")
 
-    if not tables:
-        doc.add_paragraph("(Không phát hiện bảng nào trong tài liệu này.)")
-    else:
-        for idx, df in enumerate(tables, start=1):
-            doc.add_heading(f"Table {idx}", level=2)
-            n_rows, n_cols = len(df), len(df.columns)
-            if n_cols == 0:
-                continue
-            table = doc.add_table(rows=n_rows + 1, cols=n_cols)
-            table.style = "Table Grid"
-
-            header_cells = table.rows[0].cells
-            for col_idx, col_name in enumerate(df.columns):
-                header_cells[col_idx].text = str(col_name)
-                for run in header_cells[col_idx].paragraphs[0].runs:
-                    run.bold = True
-
-            for row_idx, row in enumerate(df.itertuples(index=False), start=1):
-                row_cells = table.rows[row_idx].cells
-                for col_idx, value in enumerate(row):
-                    row_cells[col_idx].text = "" if value is None else str(value)
-
-            doc.add_paragraph("")
+    if table_count == 0 and not any(b.kind == "text" for b in blocks):
+        doc.add_paragraph("(Không có nội dung trích xuất được.)")
 
     try:
         doc.save(str(output_path))
     except Exception as exc:
         raise IOError(f"Failed to write Word document '{output_path}': {exc}") from exc
 
-    logger.info("Saved Word document (%d table(s)) -> %s", len(tables), output_path)
+    logger.info("Saved ordered Word document (%d table(s)) -> %s", table_count, output_path)
     return output_path
+
+
+def export_document_from_markdown(
+    markdown: str,
+    extracted_tables: list[pd.DataFrame],
+    output_path: str | Path,
+    *,
+    apply_ocr_cleanup: bool = True,
+) -> tuple[Path, list[pd.DataFrame]]:
+    """Assemble reading-order DOCX from Marker markdown + extracted tables."""
+    blocks = assemble_document_blocks(
+        markdown, extracted_tables, apply_ocr_cleanup=apply_ocr_cleanup
+    )
+    path = export_ordered_docx(blocks, output_path)
+    tables = [
+        b.content for b in blocks if b.kind == "table" and isinstance(b.content, pd.DataFrame)
+    ]
+    return path, tables
+
+
+def export_document(
+    text: str,
+    tables: list[pd.DataFrame],
+    output_path: str | Path,
+) -> Path:
+    """
+    Assemble one readable Word (.docx) file from prose + tables.
+
+    Prefer `export_document_from_markdown` when Marker reading order matters.
+    This helper remains for callers that already split prose/tables.
+    """
+    blocks: list[AssembledBlock] = []
+    if text and text.strip():
+        blocks.append(AssembledBlock(kind="text", content=text.strip()))
+    for df in tables:
+        blocks.append(AssembledBlock(kind="table", content=df))
+    return export_ordered_docx(blocks, output_path)
 
 
 class DocumentExporter:

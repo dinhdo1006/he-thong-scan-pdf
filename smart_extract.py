@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-CLI entrypoint: Unified PDF -> single plain-text .txt output.
+CLI entrypoint: Unified PDF -> form-faithful .docx (+ tables xlsx, debug txt).
 
 Usage:
-    python smart_extract.py -i path/to/file.pdf -o result.txt
-    python smart_extract.py -i path/to/file.pdf -o ./output   # writes ./output/output.txt
+    python smart_extract.py -i path/to/file.pdf -o ./output
+    python smart_extract.py -i path/to/file.pdf -o result.docx
 """
 
 from __future__ import annotations
@@ -14,20 +14,20 @@ import logging
 import sys
 from pathlib import Path
 
-from pdf_extractor.exporters import DEFAULT_OUTPUT_TXT
+from pdf_extractor.exporters import DEFAULT_OUTPUT_DOCX
 from pdf_extractor.unified_pipeline import UnifiedPDFPipeline
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Extract PDF to a single plain-text .txt file (prose + tables)."
+        description="Extract PDF to form-faithful Word .docx (prose + real tables)."
     )
     parser.add_argument("--input", "-i", required=True, help="Path to the input PDF file.")
     parser.add_argument(
         "--output",
         "-o",
-        default=DEFAULT_OUTPUT_TXT,
-        help="Output .txt path, or a directory (writes output.txt inside).",
+        default=DEFAULT_OUTPUT_DOCX,
+        help="Output .docx path, or a directory (writes output.docx inside).",
     )
     parser.add_argument(
         "--skip-tables",
@@ -61,7 +61,11 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print("Done.")
-    print(f"  Output:             {result.output_path}")
+    print(f"  DOCX:               {result.docx_path}")
+    if result.xlsx_path:
+        print(f"  Tables (xlsx):      {result.xlsx_path}")
+    if result.txt_path:
+        print(f"  Text (debug):       {result.txt_path}")
     if result.pages_with_tables:
         print(f"  Table page(s):      {[p + 1 for p in result.pages_with_tables]}")
         print(f"  Backend:            {result.table_backend_used}")
