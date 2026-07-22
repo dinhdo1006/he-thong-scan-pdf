@@ -95,6 +95,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  Backend:            {result.table_backend_used}")
         if result.used_marker_table_fallback:
             print("  WARNING: Marker OCR fallback -- fix VLM/Paddle for real table quality.")
+        if result.table_count <= 0 or result.table_backend_used == "failed":
+            print("  ERROR: detected table pages but extracted 0 tables.")
+            return 2
     else:
         print("  No tables detected -- text-only extraction.")
 

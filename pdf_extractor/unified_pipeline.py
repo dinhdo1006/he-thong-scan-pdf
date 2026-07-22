@@ -58,6 +58,7 @@ BACKEND_VLM = "vlm"
 BACKEND_PADDLE = "paddle"
 BACKEND_GRID = "grid"
 BACKEND_MARKER = "marker"
+BACKEND_FAILED = "failed"
 
 
 @dataclass
@@ -286,18 +287,24 @@ class UnifiedPDFPipeline:
             backend = BACKEND_MARKER
         else:
             self.marker.unload()
+            table_error: Optional[str] = None
             try:
                 dataframes, backend = self._extract_tables(pdf_path, work_dir, pages_with_tables)
             except Exception as exc:
-                logger.warning("Table extraction failed (%s) -- will use Marker tables.", exc)
-                dataframes, backend = [], BACKEND_MARKER
+                table_error = str(exc)
+                logger.error("Table extraction failed: %s", exc)
+                dataframes, backend = [], BACKEND_FAILED
+
             if not dataframes:
-                used_marker_fallback = True
-                backend = BACKEND_MARKER
+                # Marker is skipped by default -- do NOT pretend Marker saved us.
+                used_marker_fallback = False
+                backend = BACKEND_FAILED
                 logger.error(
-                    "BACKEND=marker fallback. Table quality will be poor on scanned forms. "
-                    "Check VLM (transformers/Qwen2-VL + CUDA) and/or: "
-                    "pip install paddlepaddle==3.2.2 'paddleocr>=3.0' 'paddlex[ocr]'"
+                    "Table pages %s were detected but every backend returned 0 tables. "
+                    "Install/fix: pip install paddlepaddle==3.2.2 'paddleocr>=3.0' 'paddlex[ocr]'. "
+                    "Detail: %s",
+                    [p + 1 for p in pages_with_tables],
+                    table_error or "empty result",
                 )
 
         final_tables: List[pd.DataFrame] = []
@@ -314,10 +321,28 @@ class UnifiedPDFPipeline:
                 b.content for b in blocks if b.kind == "table" and isinstance(b.content, pd.DataFrame)
             ]
 
+        # Safety net: if assemble dropped tables but backends returned grids, keep them.
+        if dataframes and not final_tables:
+            logger.warning(
+                "Document assembler dropped %d extracted table(s); exporting them anyway.",
+                len(dataframes),
+            )
+            final_tables = list(dataframes)
+
         written_xlsx: Optional[Path] = None
         if write_xlsx:
+            empty_reason = None
+            if not final_tables and pages_with_tables and not skip_tables:
+                empty_reason = (
+                    "Table pages were detected but extraction backends returned 0 tables. "
+                    "Check PaddleOCR install / logs (not a Marker OCR table)."
+                )
             written = export_tables_preview(
-                final_tables, xlsx_path, write_csv=True, write_markdown=False
+                final_tables,
+                xlsx_path,
+                write_csv=True,
+                write_markdown=False,
+                empty_reason=empty_reason,
             )
             written_xlsx = written["xlsx"]
 

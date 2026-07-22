@@ -56,9 +56,28 @@ def _skip_marker(*, skip_marker: bool | None = None, force_marker: bool = False)
     return True
 
 
+def _project_root() -> Path:
+    """Repo root that contains the `pdf_extractor` package."""
+    return Path(__file__).resolve().parent.parent
+
+
 def _run_worker(payload: str, *, label: str, timeout_s: int = 1800) -> None:
     """Execute a short Python worker script in a fresh interpreter."""
-    logger.info("Starting isolated %s worker (timeout=%ss)...", label, timeout_s)
+    root = _project_root()
+    env = os.environ.copy()
+    # Ensure `import pdf_extractor` works even if the user launched CLI from
+    # another cwd (this was a silent cause of empty-table runs).
+    prev = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = str(root) + (os.pathsep + prev if prev else "")
+    env.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+
+    logger.info(
+        "Starting isolated %s worker (timeout=%ss, cwd=%s)...",
+        label,
+        timeout_s,
+        root,
+    )
     try:
         completed = subprocess.run(
             [sys.executable, "-c", payload],
@@ -67,6 +86,8 @@ def _run_worker(payload: str, *, label: str, timeout_s: int = 1800) -> None:
             encoding="utf-8",
             errors="replace",
             timeout=timeout_s,
+            cwd=str(root),
+            env=env,
         )
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(f"Isolated {label} worker timed out after {timeout_s}s") from exc
@@ -138,29 +159,49 @@ def extract_paddle_tables_isolated(pdf_path: Path, work_dir: Path) -> List[pd.Da
     work_dir.mkdir(parents=True, exist_ok=True)
     out_xlsx = work_dir / ".tmp_paddle_isolated.xlsx"
     if out_xlsx.exists():
-        out_xlsx.unlink()
+        try:
+            out_xlsx.unlink()
+        except OSError:
+            # Locked by Excel/viewer -- write a unique sibling instead.
+            out_xlsx = work_dir / f".tmp_paddle_isolated_{os.getpid()}.xlsx"
 
     payload = f"""
 from pathlib import Path
 from pdf_extractor.logging_config import configure_app_logging
 from pdf_extractor.paddle_extractor import extract
 
-configure_app_logging(verbose=False)
-pdf = Path(r'''{pdf_path}''')
-out = Path(r'''{out_xlsx}''')
+configure_app_logging(verbose=True)
+pdf = Path(r'''{Path(pdf_path).resolve()}''')
+out = Path(r'''{out_xlsx.resolve()}''')
+if not pdf.is_file():
+    raise SystemExit(f'PDF missing: {{pdf}}')
 dfs = extract(pdf, output_path=out, apply_ocr_cleanup=True)
-print(f'PADDLE_OK tables={{len(dfs)}}')
+print(f'PADDLE_OK tables={{len(dfs)}} path={{out}}')
+if not dfs:
+    raise SystemExit('Paddle returned 0 tables')
 """
     _run_worker(payload, label="paddle", timeout_s=PADDLE_TIMEOUT_S)
     if not out_xlsx.is_file():
-        return []
+        raise RuntimeError(f"Paddle worker finished but did not write {out_xlsx}")
 
     frames: List[pd.DataFrame] = []
     xl = pd.ExcelFile(out_xlsx)
     for sheet in xl.sheet_names:
         df = pd.read_excel(out_xlsx, sheet_name=sheet, dtype=str).fillna("")
-        if list(df.columns) == ["info"] and len(df) == 1 and "No tables" in str(df.iloc[0, 0]):
+        info_placeholder = (
+            list(df.columns) == ["info"]
+            and len(df) == 1
+            and "No tables" in str(df.iloc[0, 0])
+        )
+        if info_placeholder:
             continue
         if not df.empty:
             frames.append(df)
+
+    if not frames:
+        raise RuntimeError(
+            f"Paddle wrote {out_xlsx} but no usable table sheets were found "
+            f"(sheets={xl.sheet_names})."
+        )
+    logger.info("Isolated paddle returned %d table(s).", len(frames))
     return frames

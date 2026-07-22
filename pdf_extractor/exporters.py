@@ -545,6 +545,7 @@ def export_tables_preview(
     *,
     write_csv: bool = True,
     write_markdown: bool = True,
+    empty_reason: str | None = None,
 ) -> dict[str, Path]:
     """
     Write tables for both Excel and VS Code-friendly previews.
@@ -558,12 +559,13 @@ def export_tables_preview(
     xlsx_path = Path(output_xlsx).expanduser().resolve()
     xlsx_path.parent.mkdir(parents=True, exist_ok=True)
     written: dict[str, Path] = {}
+    placeholder = empty_reason or "No tables found in document."
 
     # --- Excel (open with LibreOffice / Excel, not VS Code) ---
     try:
         with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
             if not tables:
-                pd.DataFrame({"info": ["No tables found in document."]}).to_excel(
+                pd.DataFrame({"info": [placeholder]}).to_excel(
                     writer, sheet_name="No_Tables", index=False
                 )
             else:
@@ -581,7 +583,7 @@ def export_tables_preview(
     if write_csv:
         if not tables:
             csv_path = out_dir / f"{stem}_empty.csv"
-            pd.DataFrame({"info": ["No tables found in document."]}).to_csv(
+            pd.DataFrame({"info": [placeholder]}).to_csv(
                 csv_path, index=False, encoding="utf-8-sig"
             )
             written["csv"] = csv_path
@@ -598,7 +600,7 @@ def export_tables_preview(
     if write_markdown:
         md_path = out_dir / f"{stem}_preview.md"
         if not tables:
-            md_body = "# Tables preview\n\n_No tables found in document._\n"
+            md_body = f"# Tables preview\n\n_{placeholder}_\n"
         else:
             parts = ["# Tables preview\n"]
             for idx, df in enumerate(tables, start=1):
