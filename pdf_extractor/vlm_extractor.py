@@ -47,6 +47,7 @@ from PIL import Image
 
 from .exporters import export_tables_preview
 from .ocr_cleanup import clean_ocr_errors
+from .table_layout import looks_like_outline_continuation, repair_form_table
 
 logger = logging.getLogger(__name__)
 
@@ -748,6 +749,21 @@ class VLMTableExtractor:
                     len(nxt),
                     len(prev.columns),
                 )
+            elif looks_like_outline_continuation(prev, nxt):
+                # Page-2 often promotes the first data row to headers so
+                # header-token overlap fails — still merge by outline order.
+                cont = repair_form_table(nxt.copy())
+                if len(cont.columns) == len(prev.columns):
+                    cont.columns = list(prev.columns)
+                    stitched[-1] = pd.concat([prev, cont], ignore_index=True)
+                    logger.info(
+                        "Stitched outline-continuation table (%d + %d rows, %d cols).",
+                        len(prev),
+                        len(cont),
+                        len(prev.columns),
+                    )
+                else:
+                    stitched.append(nxt.copy())
             else:
                 stitched.append(nxt.copy())
         return stitched

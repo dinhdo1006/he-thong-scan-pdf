@@ -12,6 +12,7 @@ import pandas as pd
 
 from .markdown_parser import MarkdownBlockParser
 from .ocr_cleanup import clean_ocr_errors, clean_text_ocr_errors
+from .table_layout import repair_form_table, stitch_outline_continuation_tables
 
 logger = logging.getLogger(__name__)
 
@@ -371,6 +372,9 @@ def dataframe_to_plaintext_table(df: pd.DataFrame) -> str:
 
 def _prepare_table_df(df: pd.DataFrame, *, apply_ocr_cleanup: bool) -> pd.DataFrame:
     prepared = _split_multi_value_cells(df)
+    # Fix cell shifts / false headers before OCR text cleanup so corrections
+    # apply to the realigned cells.
+    prepared = repair_form_table(prepared)
     if apply_ocr_cleanup:
         prepared = clean_ocr_errors(prepared)
     return prepared
@@ -502,7 +506,34 @@ def assemble_document_blocks(
                 cand.shape,
             )
 
-    return parts
+    return _merge_outline_continuation_blocks(parts)
+
+
+def _merge_outline_continuation_blocks(parts: list[AssembledBlock]) -> list[AssembledBlock]:
+    """
+    Merge consecutive assembled table blocks that continue the same outline
+    form across a page break (e.g. page1 ends at 1.3.1, page2 starts at 1.3.2).
+    Prose between tables blocks stitching for that pair.
+    """
+    out: list[AssembledBlock] = []
+    i = 0
+    while i < len(parts):
+        block = parts[i]
+        if block.kind != "table":
+            out.append(block)
+            i += 1
+            continue
+
+        run: list[pd.DataFrame] = []
+        while i < len(parts) and parts[i].kind == "table":
+            content = parts[i].content
+            assert isinstance(content, pd.DataFrame)
+            run.append(content)
+            i += 1
+
+        for df in stitch_outline_continuation_tables(run):
+            out.append(AssembledBlock(kind="table", content=df))
+    return out
 
 
 def compose_document_txt(
