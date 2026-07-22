@@ -64,9 +64,10 @@ Rules (apply to ANY table, any language, any layout -- never assume a named temp
 1. Return each physical table as one HTML <table> element, in reading order.
 2. One row of the printed grid = one <tr>. One printed cell = one <td> (use <th> only for a clear header row/cell).
 3. Preserve the exact column count of the printed grid in every row. Never merge two adjacent cells into one value -- two separate number cells must stay two separate <td> cells.
-4. A cell with no visible text is still a cell: use an empty <td></td>, never omit it.
-5. If a header cell visually spans multiple columns or rows, use colspan/rowspan on that <th> exactly as printed -- do not flatten it into one column.
-6. Return ONLY the <table>...</table> element(s). No markdown fences, no <html>/<body> wrapper, no commentary before or after.
+4. A cell with no visible text is still a cell: use an empty <td></td>, never omit it. Never drop blank columns in the middle of a form.
+5. Keep the visual column positions: left-to-right order of <td> must match the printed form left-to-right.
+6. If a header cell visually spans multiple columns or rows, use colspan/rowspan on that <th> exactly as printed -- do not flatten it into one column.
+7. Return ONLY the <table>...</table> element(s). No markdown fences, no <html>/<body> wrapper, no commentary before or after.
 
 Example of the exact shape (structure only, not real content):
 <table>
@@ -618,12 +619,45 @@ class VLMTableExtractor:
         return []
 
     @staticmethod
-    def _stitch_continuation_tables(tables: List[pd.DataFrame]) -> List[pd.DataFrame]:
+    def _headers_compatible(prev_cols: List[str], next_cols: List[str]) -> bool:
         """
-        Generic multi-page stitch: if consecutive tables have the SAME column
-        count, treat the later one as a continuation of the earlier one and
-        concatenate rows (using the first table's column names). No template
-        knowledge — only structural similarity.
+        Require same width AND enough header-token overlap before stitching.
+
+        Same column count alone is too weak: two unrelated form tables can
+        share width and get wrongly glued, destroying page/position form.
+        """
+        if len(prev_cols) != len(next_cols) or len(prev_cols) == 0:
+            return False
+
+        def _norm(name: object) -> str:
+            return " ".join(str(name).lower().split())
+
+        prev_n = [_norm(c) for c in prev_cols]
+        next_n = [_norm(c) for c in next_cols]
+
+        generic = re.compile(r"^(?:col(?:_\d+)?|column_\d+)$")
+        prev_generic = all(generic.fullmatch(c or "") for c in prev_n)
+        next_generic = all(generic.fullmatch(c or "") for c in next_n)
+        # Both sides synthetic -> width match is enough (continuation without headers).
+        if prev_generic and next_generic:
+            return True
+        # One side synthetic -> allow stitch (continuation page often drops header).
+        if prev_generic or next_generic:
+            return True
+
+        matches = sum(1 for a, b in zip(prev_n, next_n) if a and a == b)
+        # Also accept high token overlap when order drifts slightly.
+        prev_tokens = {t for c in prev_n for t in c.split() if t}
+        next_tokens = {t for c in next_n for t in c.split() if t}
+        overlap = len(prev_tokens & next_tokens) / max(1, len(prev_tokens | next_tokens))
+        return matches >= max(1, len(prev_n) // 2) or overlap >= 0.5
+
+    @classmethod
+    def _stitch_continuation_tables(cls, tables: List[pd.DataFrame]) -> List[pd.DataFrame]:
+        """
+        Generic multi-page stitch: only concatenate when consecutive tables
+        share width AND compatible headers. Prevents unrelated same-width
+        tables from being glued together.
         """
         if len(tables) <= 1:
             return tables
@@ -631,7 +665,7 @@ class VLMTableExtractor:
         stitched: List[pd.DataFrame] = [tables[0].copy()]
         for nxt in tables[1:]:
             prev = stitched[-1]
-            if len(prev.columns) == len(nxt.columns) and len(prev.columns) > 0:
+            if cls._headers_compatible(list(prev.columns), list(nxt.columns)):
                 cont = nxt.copy()
                 cont.columns = list(prev.columns)
                 stitched[-1] = pd.concat([prev, cont], ignore_index=True)

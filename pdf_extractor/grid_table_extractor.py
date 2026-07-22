@@ -140,7 +140,12 @@ def _dedupe_headers(header_row: List[Optional[str]]) -> List[str]:
     return clean_names
 
 
-def table_to_dataframe(table: RawTable, header_row: bool = True) -> pd.DataFrame:
+def table_to_dataframe(
+    table: RawTable,
+    header_row: bool = True,
+    *,
+    add_provenance: bool = False,
+) -> pd.DataFrame:
     """
     Convert one RawTable's raw list-of-lists into a clean pandas DataFrame.
 
@@ -150,6 +155,9 @@ def table_to_dataframe(table: RawTable, header_row: bool = True) -> pd.DataFrame
             column headers. If False, generic "Column_1", "Column_2", ...
             names are generated and every row (including the first) is data --
             use this for tables that have no header row at all.
+        add_provenance: If True, prepend `page` / `table_index` columns.
+            Default False so the grid keeps the printed form width when the
+            DataFrame is later matched/merged into the document text output.
 
     Empty cells (pdfplumber's `None` marker for "no text detected in this grid
     cell") are converted to empty strings here, so every downstream step (OCR
@@ -179,16 +187,24 @@ def table_to_dataframe(table: RawTable, header_row: bool = True) -> pd.DataFrame
         )
 
     df = pd.DataFrame(normalized_rows, columns=columns)
-    # Provenance columns -- always useful when a workbook has many small tables
-    # spread across pages, and cost nothing in terms of hardcoding.
-    df.insert(0, "table_index", table.index_on_page)
-    df.insert(0, "page", table.page + 1)
+    if add_provenance:
+        # Provenance columns -- useful for multi-sheet Excel debugging only.
+        df.insert(0, "table_index", table.index_on_page)
+        df.insert(0, "page", table.page + 1)
     return df
 
 
-def tables_to_dataframes(tables: List[RawTable], header_row: bool = True) -> List[pd.DataFrame]:
+def tables_to_dataframes(
+    tables: List[RawTable],
+    header_row: bool = True,
+    *,
+    add_provenance: bool = False,
+) -> List[pd.DataFrame]:
     """Convert every detected RawTable into its own clean DataFrame."""
-    return [table_to_dataframe(t, header_row=header_row) for t in tables]
+    return [
+        table_to_dataframe(t, header_row=header_row, add_provenance=add_provenance)
+        for t in tables
+    ]
 
 
 # --- Visual (pixel-based) fallback: for SCANNED pages ------------------------
@@ -422,6 +438,7 @@ def extract_pdf_tables_to_excel(
     table_settings: Dict[str, str] = DEFAULT_TABLE_SETTINGS,
     header_row: bool = True,
     apply_ocr_cleanup: bool = True,
+    add_provenance: bool = False,
 ) -> List[pd.DataFrame]:
     """
     Full pipeline: detect every bordered table -> DataFrame -> OCR cleanup -> Excel.
@@ -431,11 +448,16 @@ def extract_pdf_tables_to_excel(
     OCR post-processing pass entirely; when True (default), the wrong->right
     mapping is loaded dynamically from `ocr_corrections.json` (see
     `ocr_cleanup.py`) -- no dictionary is hardcoded here.
+
+    `add_provenance=False` by default so form width stays intact for document
+    merge; pass True for standalone Excel debugging sheets.
     """
     with load_pdf(pdf_path) as pdf:
         raw_tables = extract_raw_tables(pdf, table_settings=table_settings)
 
-    dataframes = tables_to_dataframes(raw_tables, header_row=header_row)
+    dataframes = tables_to_dataframes(
+        raw_tables, header_row=header_row, add_provenance=add_provenance
+    )
 
     if apply_ocr_cleanup:
         dataframes = [clean_ocr_errors(df) for df in dataframes]

@@ -43,6 +43,188 @@ def _markdown_text_to_plain(text: str) -> str:
     return "\n".join(lines).strip()
 
 
+_GENERIC_HEADER_RE = re.compile(r"^(?:col(?:_\d+)?|Column_\d+)$", re.IGNORECASE)
+_NUMBER_LIKE_RE = re.compile(r"^[\d.,]+$")
+# Minimum similarity before an extracted table may replace a Marker block.
+# Below this we keep Marker's grid so wrong VLM/Paddle output cannot scramble form.
+_MIN_TABLE_MATCH_SCORE = 0.45
+
+
+def _clean_cell_text(value: object) -> str:
+    """Normalize one cell for display / comparison without dropping empties."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    text = str(value)
+    text = text.replace("\n", " ").replace("\r", " ")
+    text = text.replace("<br>", " ").replace("<br/>", " ").replace("<br />", " ")
+    text = text.replace("\t", " ")
+    return " ".join(text.split())
+
+
+def _is_generic_header(name: str) -> bool:
+    return bool(_GENERIC_HEADER_RE.fullmatch(name.strip()))
+
+
+def _headers_are_generic(columns: list[str]) -> bool:
+    return bool(columns) and all(_is_generic_header(c) for c in columns)
+
+
+def _dataframe_matrix(df: pd.DataFrame, *, include_header: bool) -> list[list[str]]:
+    """Flatten a DataFrame to a 2D string grid, preserving empty cells."""
+    cols = [_clean_cell_text(c) for c in df.columns]
+    body = [
+        [_clean_cell_text(df.iloc[r, c]) for c in range(len(df.columns))]
+        for r in range(len(df))
+    ]
+    if include_header and not _headers_are_generic(cols):
+        return [cols, *body]
+    return body
+
+
+def _token_set(text: str) -> set[str]:
+    return {t.lower() for t in re.findall(r"[\w./%+-]+", text, flags=re.UNICODE) if t}
+
+
+def _content_overlap_score(a: pd.DataFrame, b: pd.DataFrame, sample_rows: int = 8) -> float:
+    """Cheap bag-of-tokens overlap over the first few data rows."""
+    def _sample(df: pd.DataFrame) -> set[str]:
+        tokens: set[str] = set()
+        for r in range(min(sample_rows, len(df))):
+            for c in range(len(df.columns)):
+                tokens |= _token_set(_clean_cell_text(df.iloc[r, c]))
+        for c in df.columns:
+            tokens |= _token_set(_clean_cell_text(c))
+        return tokens
+
+    ta, tb = _sample(a), _sample(b)
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
+def table_shape_similarity(marker_df: pd.DataFrame, extracted_df: pd.DataFrame) -> float:
+    """
+    Score how safely an extracted table can replace a Marker table block.
+
+    Weighted by column count (form structure), row count, and token overlap.
+    """
+    m_cols, e_cols = len(marker_df.columns), len(extracted_df.columns)
+    m_rows, e_rows = len(marker_df), len(extracted_df)
+    if m_cols == 0 or e_cols == 0:
+        return 0.0
+
+    col_ratio = min(m_cols, e_cols) / max(m_cols, e_cols)
+    # Exact column match is critical for form layout.
+    if abs(m_cols - e_cols) == 0:
+        col_score = 1.0
+    elif abs(m_cols - e_cols) == 1:
+        col_score = 0.7 * col_ratio
+    else:
+        col_score = 0.35 * col_ratio
+
+    if max(m_rows, e_rows) == 0:
+        row_score = 1.0
+    else:
+        row_score = min(m_rows, e_rows) / max(m_rows, e_rows)
+        # Stitched multi-page tables are taller than one Marker block — soft-penalize only.
+        if e_rows > m_rows * 2 and m_rows > 0:
+            row_score = max(row_score, 0.55)
+
+    content = _content_overlap_score(marker_df, extracted_df)
+    return 0.5 * col_score + 0.25 * row_score + 0.25 * content
+
+
+def _pick_best_extracted_index(
+    marker_df: pd.DataFrame,
+    candidates: list[pd.DataFrame | None],
+) -> tuple[int, float] | None:
+    """Return (index, score) of the best unused candidate, or None if none match."""
+    best_idx: int | None = None
+    best_score = -1.0
+    for idx, cand in enumerate(candidates):
+        if cand is None:
+            continue
+        score = table_shape_similarity(marker_df, cand)
+        if score > best_score:
+            best_score = score
+            best_idx = idx
+    if best_idx is None or best_score < _MIN_TABLE_MATCH_SCORE:
+        return None
+    return best_idx, best_score
+
+
+def _slice_stitched_table(
+    marker_df: pd.DataFrame,
+    extracted_df: pd.DataFrame,
+    row_cursor: dict[int, int],
+    extracted_index: int,
+    *,
+    share_across_blocks: bool,
+) -> pd.DataFrame:
+    """
+    When a backend stitches multi-page rows into one tall table AND Marker has
+    multiple table blocks, carve out a Marker-sized slice so each document
+    position keeps its own block. Single-block docs keep the full extracted
+    table (no silent truncation).
+    """
+    if not share_across_blocks or len(extracted_df.columns) != len(marker_df.columns):
+        row_cursor[extracted_index] = len(extracted_df)
+        return extracted_df
+
+    start = row_cursor.get(extracted_index, 0)
+    need = max(len(marker_df), 1)
+    if start >= len(extracted_df):
+        return extracted_df.iloc[0:0].copy()
+
+    end = min(len(extracted_df), start + need)
+    remaining = len(extracted_df) - start
+    if remaining <= need + 2:
+        end = len(extracted_df)
+
+    sliced = extracted_df.iloc[start:end].copy()
+    marker_headers = [_clean_cell_text(c) for c in marker_df.columns]
+    if not _headers_are_generic(marker_headers):
+        sliced.columns = list(marker_df.columns)
+    row_cursor[extracted_index] = end
+    return sliced.reset_index(drop=True)
+
+
+def merge_table_preserving_form(
+    marker_df: pd.DataFrame,
+    extracted_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Prefer extracted cell values when shapes align; keep Marker headers / width
+    when they better describe the printed form.
+    """
+    marker_cols = [_clean_cell_text(c) for c in marker_df.columns]
+    extracted_cols = [_clean_cell_text(c) for c in extracted_df.columns]
+
+    # Same width: take extracted body, prefer real Marker headers over generic ones.
+    if len(marker_cols) == len(extracted_cols) and len(marker_cols) > 0:
+        body = [
+            [_clean_cell_text(extracted_df.iloc[r, c]) for c in range(len(extracted_cols))]
+            for r in range(len(extracted_df))
+        ]
+        if _headers_are_generic(extracted_cols) and not _headers_are_generic(marker_cols):
+            headers = marker_cols
+        elif not _headers_are_generic(extracted_cols):
+            headers = extracted_cols
+        else:
+            headers = marker_cols if marker_cols else extracted_cols
+        return pd.DataFrame(body, columns=headers)
+
+    # Extracted is narrower but Marker collapsed numbers into one cell — expand Marker.
+    expanded_marker = _split_multi_value_cells(marker_df)
+    if len(expanded_marker.columns) == len(extracted_cols):
+        return merge_table_preserving_form(expanded_marker, extracted_df)
+
+    # Width mismatch: keep the wider grid (closer to printed form), fill from overlap.
+    if len(marker_cols) >= len(extracted_cols):
+        return marker_df.copy()
+    return extracted_df.copy()
+
+
 def _split_multi_value_cells(df: pd.DataFrame) -> pd.DataFrame:
     """
     Post-process a Marker-fallback DataFrame where one cell contains two
@@ -53,12 +235,11 @@ def _split_multi_value_cells(df: pd.DataFrame) -> pd.DataFrame:
     column is replaced by two sub-columns named "col" and "col_2".
     Generic: no column-name or template assumption.
     """
-    NUMBER_LIKE = re.compile(r"^[\d.,]+$")
 
     def _try_split(cell: str) -> list[str] | None:
         """Return [part1, part2, ...] if cell is 2+ number tokens, else None."""
         parts = cell.strip().split()
-        if len(parts) >= 2 and all(NUMBER_LIKE.match(p) for p in parts):
+        if len(parts) >= 2 and all(_NUMBER_LIKE_RE.match(p) for p in parts):
             return parts
         return None
 
@@ -68,7 +249,7 @@ def _split_multi_value_cells(df: pd.DataFrame) -> pd.DataFrame:
 
     # Iterate by position to avoid duplicate-column issues with df[name]
     for col_pos, col in enumerate(df.columns):
-        raw: list[str] = [str(v) for v in df.iloc[:, col_pos]]
+        raw: list[str] = [_clean_cell_text(v) for v in df.iloc[:, col_pos]]
         splits: list[list[str] | None] = [_try_split(v) for v in raw]
         max_parts = max((len(s) for s in splits if s is not None), default=1)
 
@@ -106,26 +287,42 @@ def _split_multi_value_cells(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def dataframe_to_plaintext_table(df: pd.DataFrame) -> str:
-    """Render a DataFrame as a tab-separated plain-text grid.
+    """
+    Render a DataFrame as a fixed-width pipe grid so columns stay aligned.
 
-    Uses positional (iloc) access to safely handle DataFrames with
-    duplicate column names.
+    Empty cells are preserved as blank slots (critical for form layouts).
+    Generic synthetic headers (`col`, `Column_1`, ...) are omitted.
     """
     if df.empty or len(df.columns) == 0:
         return ""
 
-    def _clean(s: str) -> str:
-        return s.replace("\n", " ").replace("<br>", " ").replace("<br/>", " ").replace("\t", " ")
+    matrix = _dataframe_matrix(df, include_header=True)
+    if not matrix:
+        return ""
 
-    columns = [_clean(str(c)) for c in df.columns]
-    generic_header = all(re.fullmatch(r"col(?:_\d+)?", col) for col in columns)
+    width = max(len(row) for row in matrix)
+    normalized: list[list[str]] = []
+    for row in matrix:
+        padded = list(row) + [""] * (width - len(row))
+        normalized.append(padded[:width])
+
+    col_widths = [1] * width
+    for row in normalized:
+        for i, cell in enumerate(row):
+            col_widths[i] = max(col_widths[i], len(cell))
+
     lines: list[str] = []
-    if not generic_header:
-        lines.append("\t".join(columns))
-    for row_idx in range(len(df)):
-        cells = [_clean(str(df.iloc[row_idx, col_idx])) for col_idx in range(len(df.columns))]
-        lines.append("\t".join(cells))
+    for row in normalized:
+        cells = [cell.ljust(col_widths[i]) for i, cell in enumerate(row)]
+        lines.append("| " + " | ".join(cells) + " |")
     return "\n".join(lines)
+
+
+def _prepare_table_df(df: pd.DataFrame, *, apply_ocr_cleanup: bool) -> pd.DataFrame:
+    prepared = _split_multi_value_cells(df)
+    if apply_ocr_cleanup:
+        prepared = clean_ocr_errors(prepared)
+    return prepared
 
 
 def compose_document_txt(
@@ -137,16 +334,24 @@ def compose_document_txt(
     """
     Build ONE plain-text document from Marker Markdown + optional extracted tables.
 
-    Walks Markdown blocks in reading order. For each table block:
-      - use the next extracted DataFrame when the VLM/grid backend succeeded;
-      - otherwise keep Marker's table for that block (so content is never lost).
+    Walks Markdown blocks in document reading order (this is what preserves
+    position). For each Marker table block:
+      1. pick the best-matching extracted table by shape/content score;
+      2. if score is too low, keep Marker's own grid (never FIFO-assign a wrong table);
+      3. if a stitched extracted table is taller than the block, slice by row count;
+      4. merge so form width/headers stay intact.
 
-  Prose blocks are lightly cleaned (headings, <br>) and run through
-  `ocr_corrections.json`.
+    Leftover extracted tables that never matched are appended at the end only
+    when Marker had zero table blocks (otherwise they would break reading order).
     """
     blocks = MarkdownBlockParser().parse_blocks(markdown)
-    extracted_queue = list(extracted_tables)
+    candidates: list[pd.DataFrame | None] = list(extracted_tables)
+    used_flags = [False] * len(candidates)
+    row_cursors: dict[int, int] = {}
     parts: list[str] = []
+    marker_table_count = sum(1 for b in blocks if b.kind == "table")
+    share_across_blocks = marker_table_count > 1
+    seen_marker_tables = 0
 
     for block in blocks:
         if block.kind == "text":
@@ -157,24 +362,74 @@ def compose_document_txt(
                 parts.append(plain)
             continue
 
-        df = extracted_queue.pop(0) if extracted_queue else block.content
-        assert isinstance(df, pd.DataFrame)
-        df = _split_multi_value_cells(df)
-        if apply_ocr_cleanup:
-            df = clean_ocr_errors(df)
+        seen_marker_tables += 1
+        marker_df = block.content
+        assert isinstance(marker_df, pd.DataFrame)
+
+        pick = _pick_best_extracted_index(marker_df, candidates)
+        if pick is None:
+            df = marker_df
+            logger.debug(
+                "Table block %d: no safe extracted match -- keeping Marker grid %s.",
+                seen_marker_tables,
+                marker_df.shape,
+            )
+        else:
+            idx, score = pick
+            extracted = candidates[idx]
+            assert extracted is not None
+            sliced = _slice_stitched_table(
+                marker_df,
+                extracted,
+                row_cursors,
+                idx,
+                share_across_blocks=share_across_blocks,
+            )
+            if row_cursors.get(idx, 0) >= len(extracted):
+                candidates[idx] = None
+            used_flags[idx] = True
+            if sliced.empty:
+                df = marker_df
+                logger.debug(
+                    "Table block %d: extracted slice empty -- keeping Marker grid.",
+                    seen_marker_tables,
+                )
+            else:
+                df = merge_table_preserving_form(marker_df, sliced)
+                logger.debug(
+                    "Table block %d: matched extracted[%d] score=%.2f marker=%s extracted_slice=%s -> %s",
+                    seen_marker_tables,
+                    idx,
+                    score,
+                    marker_df.shape,
+                    sliced.shape,
+                    df.shape,
+                )
+
+        df = _prepare_table_df(df, apply_ocr_cleanup=apply_ocr_cleanup)
         table_txt = dataframe_to_plaintext_table(df)
         if table_txt.strip():
             parts.append(table_txt)
 
-    # Rare: backend returned MORE tables than Marker blocks (e.g. stitched pages).
-    while extracted_queue:
-        df = extracted_queue.pop(0)
-        df = _split_multi_value_cells(df)
-        if apply_ocr_cleanup:
-            df = clean_ocr_errors(df)
-        table_txt = dataframe_to_plaintext_table(df)
-        if table_txt.strip():
-            parts.append(table_txt)
+    # Only dump unmatched extracted tables when Marker found no table anchors —
+    # otherwise appending would move content out of its document position.
+    if marker_table_count == 0:
+        for cand in candidates:
+            if cand is None:
+                continue
+            df = _prepare_table_df(cand, apply_ocr_cleanup=apply_ocr_cleanup)
+            table_txt = dataframe_to_plaintext_table(df)
+            if table_txt.strip():
+                parts.append(table_txt)
+    else:
+        leftover = sum(
+            1 for flag, cand in zip(used_flags, candidates) if not flag and cand is not None
+        )
+        if leftover:
+            logger.info(
+                "Dropped %d unmatched extracted table(s) to preserve Marker reading order/form.",
+                leftover,
+            )
 
     body = "\n\n".join(parts)
     return body.rstrip() + ("\n" if body.strip() else "")

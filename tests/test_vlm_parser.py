@@ -59,13 +59,26 @@ class TestPayloadToDataframes(unittest.TestCase):
 
 
 class TestStitchContinuation(unittest.TestCase):
-    def test_same_width_is_stitched(self) -> None:
+    def test_same_width_compatible_headers_is_stitched(self) -> None:
+        a = pd.DataFrame([["1", "x"]], columns=["c1", "c2"])
+        b = pd.DataFrame([["2", "y"]], columns=["c1", "c2"])
+        out = VLMTableExtractor._stitch_continuation_tables([a, b])
+        self.assertEqual(len(out), 1)
+        self.assertEqual(len(out[0]), 2)
+        self.assertEqual(list(out[0].columns), ["c1", "c2"])
+
+    def test_same_width_generic_continuation_is_stitched(self) -> None:
         a = pd.DataFrame([["1", "x"]], columns=["c1", "c2"])
         b = pd.DataFrame([["2", "y"]], columns=["Column_1", "Column_2"])
         out = VLMTableExtractor._stitch_continuation_tables([a, b])
         self.assertEqual(len(out), 1)
         self.assertEqual(len(out[0]), 2)
-        self.assertEqual(list(out[0].columns), ["c1", "c2"])
+
+    def test_same_width_unrelated_headers_stay_separate(self) -> None:
+        a = pd.DataFrame([["1", "x"]], columns=["Name", "Age"])
+        b = pd.DataFrame([["Hue", "54"]], columns=["City", "Code"])
+        out = VLMTableExtractor._stitch_continuation_tables([a, b])
+        self.assertEqual(len(out), 2)
 
     def test_different_width_stays_separate(self) -> None:
         a = pd.DataFrame([["1"]], columns=["c1"])
