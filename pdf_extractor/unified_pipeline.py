@@ -6,6 +6,9 @@ Every PDF goes through the same fixed sequence:
     Step B (always):     pdfplumber/visual scan -> which pages contain a table.
     Step C (if B found): VLM (full page) -> VLM crop retry -> Paddle -> grid.
 
+On Windows CPU, Marker (torch) and Paddle collide in one process -- Step A and
+the Paddle branch of Step C run in isolated subprocesses.
+
 Primary outputs: `output.txt` + `output_tables.xlsx` (form grids).
 Optional: `output.docx` with real Word tables.
 If GPU/ML table backends fail, Marker's table blocks are kept with a loud warning.
@@ -14,6 +17,7 @@ If GPU/ML table backends fail, Marker's table blocks are kept with a loud warnin
 from __future__ import annotations
 
 import logging
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -35,6 +39,7 @@ from .grid_table_extractor import (
     detect_table_pages,
     extract_pdf_tables_to_excel,
 )
+from .isolated_backends import extract_markdown_isolated, extract_paddle_tables_isolated
 from .marker_extractor import MarkerExtractor
 from .markdown_parser import MarkdownBlockParser
 from .paddle_extractor import PaddleExtractionError
@@ -64,7 +69,15 @@ class UnifiedResult:
     txt_path: Optional[Path] = None
 
 
+def _needs_process_isolation() -> bool:
+    """True when Marker/torch and Paddle must not share one interpreter."""
+    return sys.platform.startswith("win")
+
+
 def _run_paddle_fallback(pdf_path: Path, out_dir: Path) -> List[pd.DataFrame]:
+    if _needs_process_isolation():
+        return extract_paddle_tables_isolated(pdf_path, out_dir)
+
     tmp_path = out_dir / ".tmp_paddle_fallback.xlsx"
     try:
         return paddle_extract(pdf_path, output_path=tmp_path, apply_ocr_cleanup=True)
@@ -102,33 +115,63 @@ class UnifiedPDFPipeline:
     def _detect_table_pages(self, pdf_path: Path) -> List[int]:
         return detect_table_pages(pdf_path, table_settings=self.table_settings)
 
+    def _extract_markdown(self, pdf_path: Path, work_dir: Path) -> str:
+        if _needs_process_isolation():
+            logger.info("Windows: running Marker in an isolated subprocess (torch/paddle DLL split).")
+            return extract_markdown_isolated(pdf_path, work_dir)
+        try:
+            return self.marker.extract_markdown(pdf_path)
+        except Exception as exc:
+            logger.warning("Marker failed (%s) -- using PyMuPDF text fallback.", exc)
+            from .text_fallback import extract_plaintext_fallback, plaintext_as_markdown
+
+            return plaintext_as_markdown(extract_plaintext_fallback(pdf_path))
+
+
+    @staticmethod
+    def _cuda_available() -> bool:
+        try:
+            import torch
+
+            return bool(torch.cuda.is_available())
+        except Exception:
+            return False
+
     def _extract_tables(
         self,
         pdf_path: Path,
         out_dir: Path,
         page_indices: List[int],
     ) -> Tuple[List[pd.DataFrame], str]:
-        # --- VLM full page (primary for scans) ---
-        try:
-            logger.info("Table backend: trying VLM on page(s) %s (full page)...", [p + 1 for p in page_indices])
-            dataframes = self.vlm.extract_pages(
-                pdf_path, page_indices=page_indices, crop_to_table=False
+        # --- VLM (GPU only; Qwen2-VL is impractical on CPU for this form) ---
+        if self._cuda_available():
+            try:
+                logger.info(
+                    "Table backend: trying VLM on page(s) %s (full page)...",
+                    [p + 1 for p in page_indices],
+                )
+                dataframes = self.vlm.extract_pages(
+                    pdf_path, page_indices=page_indices, crop_to_table=False
+                )
+                if dataframes:
+                    logger.info("VLM (full page) extracted %d table(s).", len(dataframes))
+                    return dataframes, BACKEND_VLM
+                logger.warning("VLM full-page returned 0 tables -- retrying with table-region crop.")
+                dataframes = self.vlm.extract_pages(
+                    pdf_path, page_indices=page_indices, crop_to_table=True
+                )
+                if dataframes:
+                    logger.info("VLM (cropped) extracted %d table(s).", len(dataframes))
+                    return dataframes, BACKEND_VLM
+                logger.warning("VLM returned no usable tables -- falling back to PaddleOCR.")
+            except VLMExtractionError as exc:
+                logger.warning("VLM unavailable/failed (%s) -- falling back to PaddleOCR.", exc)
+        else:
+            logger.warning(
+                "No CUDA GPU detected -- skipping VLM and using PaddleOCR PP-StructureV3 first."
             )
-            if dataframes:
-                logger.info("VLM (full page) extracted %d table(s).", len(dataframes))
-                return dataframes, BACKEND_VLM
-            logger.warning("VLM full-page returned 0 tables -- retrying with table-region crop.")
-            dataframes = self.vlm.extract_pages(
-                pdf_path, page_indices=page_indices, crop_to_table=True
-            )
-            if dataframes:
-                logger.info("VLM (cropped) extracted %d table(s).", len(dataframes))
-                return dataframes, BACKEND_VLM
-            logger.warning("VLM returned no usable tables -- falling back to PaddleOCR.")
-        except VLMExtractionError as exc:
-            logger.warning("VLM unavailable/failed (%s) -- falling back to PaddleOCR.", exc)
 
-        # --- PaddleOCR PP-Structure ---
+        # --- PaddleOCR PP-Structure (v3 on paddleocr>=3; works on CPU) ---
         try:
             logger.info("Table backend: trying PaddleOCR PP-Structure...")
             dataframes = _run_paddle_fallback(pdf_path, out_dir)
@@ -136,10 +179,10 @@ class UnifiedPDFPipeline:
                 logger.info("PaddleOCR extracted %d table(s).", len(dataframes))
                 return dataframes, BACKEND_PADDLE
             logger.warning("PaddleOCR found no tables -- falling back to pdfplumber grid.")
-        except PaddleExtractionError as exc:
+        except (PaddleExtractionError, RuntimeError, OSError) as exc:
             logger.warning(
                 "PaddleOCR unavailable/failed (%s) -- falling back to pdfplumber grid. "
-                "Install with: pip install paddlepaddle paddleocr",
+                "Install with: pip install paddlepaddle==3.2.2 'paddleocr>=3.0' 'paddlex[ocr]'",
                 exc,
             )
 
@@ -199,7 +242,7 @@ class UnifiedPDFPipeline:
 
         xlsx_path = work_dir / DEFAULT_OUTPUT_XLSX
 
-        markdown = self.marker.extract_markdown(pdf_path)
+        markdown = self._extract_markdown(pdf_path, work_dir)
         pages_with_tables = self._detect_table_pages(pdf_path)
 
         dataframes: List[pd.DataFrame] = []
@@ -216,13 +259,18 @@ class UnifiedPDFPipeline:
             backend = BACKEND_MARKER
         else:
             self.marker.unload()
-            dataframes, backend = self._extract_tables(pdf_path, work_dir, pages_with_tables)
+            try:
+                dataframes, backend = self._extract_tables(pdf_path, work_dir, pages_with_tables)
+            except Exception as exc:
+                logger.warning("Table extraction failed (%s) -- will use Marker tables.", exc)
+                dataframes, backend = [], BACKEND_MARKER
             if not dataframes:
                 used_marker_fallback = True
                 backend = BACKEND_MARKER
                 logger.error(
                     "BACKEND=marker fallback. Table quality will be poor on scanned forms. "
-                    "Check VLM (transformers/Qwen2-VL + CUDA) and/or: pip install paddlepaddle paddleocr"
+                    "Check VLM (transformers/Qwen2-VL + CUDA) and/or: "
+                    "pip install paddlepaddle==3.2.2 'paddleocr>=3.0' 'paddlex[ocr]'"
                 )
 
         final_tables: List[pd.DataFrame] = []

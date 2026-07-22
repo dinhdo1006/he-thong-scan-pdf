@@ -15,8 +15,8 @@ transformers>=4.45.0
 accelerate>=0.33.0
 qwen-vl-utils>=0.0.8
 
-# --- Optional: PaddleOCR PP-Structure pipeline (pdf_extractor/paddle_extractor.py) ---
-# No longer wired into router.py by default, but kept installable for
-# standalone use.
-# paddlepaddle>=2.6.0
-# paddleocr>=2.7.0
+# --- PaddleOCR PP-StructureV3 (CPU fallback when no CUDA for VLM) ---
+# Required on machines without NVIDIA GPU -- paddleocr 3.x uses PPStructureV3.
+paddlepaddle==3.2.2
+paddleocr>=3.0.0
+paddlex[ocr]>=3.0.0
