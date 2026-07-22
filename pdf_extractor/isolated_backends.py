@@ -28,18 +28,32 @@ MARKER_TIMEOUT_S = 90
 PADDLE_TIMEOUT_S = 1800
 
 
-def _skip_marker() -> bool:
-    """Windows CPU default: skip Marker unless FORCE_MARKER=1 (Surya often AVs)."""
-    force = os.environ.get("FORCE_MARKER", "").strip().lower() in {"1", "true", "yes"}
-    if force:
+def _skip_marker(*, skip_marker: bool | None = None, force_marker: bool = False) -> bool:
+    """
+    Decide whether to bypass Marker (Surya/transformers).
+
+    Marker import+load is slow/fragile on CPU (Linux hangs on transformers;
+    Windows often AVs). Tables come from Paddle/VLM; prose uses PyMuPDF.
+
+    Priority: explicit args > FORCE_MARKER / SKIP_MARKER env > default skip.
+    """
+    if force_marker:
+        return False
+    if skip_marker is True:
+        return True
+    if skip_marker is False:
+        return False
+
+    force_env = os.environ.get("FORCE_MARKER", "").strip().lower() in {"1", "true", "yes"}
+    if force_env:
         return False
     explicit = os.environ.get("SKIP_MARKER", "").strip().lower()
     if explicit in {"1", "true", "yes"}:
         return True
     if explicit in {"0", "false", "no"}:
         return False
-    # Default on Windows: prefer PyMuPDF prose; Marker is opt-in via FORCE_MARKER.
-    return sys.platform.startswith("win")
+    # Default: skip Marker. Opt-in with FORCE_MARKER=1 or --force-marker.
+    return True
 
 
 def _run_worker(payload: str, *, label: str, timeout_s: int = 1800) -> None:
@@ -69,9 +83,15 @@ def _run_worker(payload: str, *, label: str, timeout_s: int = 1800) -> None:
     logger.info("Isolated %s worker finished OK.", label)
 
 
-def extract_markdown_isolated(pdf_path: Path, work_dir: Path) -> str:
+def extract_markdown_isolated(
+    pdf_path: Path,
+    work_dir: Path,
+    *,
+    skip_marker: bool | None = None,
+    force_marker: bool = False,
+) -> str:
     """
-    Try Marker in a subprocess; on crash/timeout use PyMuPDF prose fallback.
+    Try Marker in a subprocess; on skip/crash/timeout use PyMuPDF prose fallback.
 
     Returns Markdown/plain text suitable for `compose_document_txt` (prose only
     when falling back -- tables come from Paddle).
@@ -94,8 +114,8 @@ out.write_text(md, encoding='utf-8')
 print(f'MARKER_OK chars={{len(md)}}')
 """
     try:
-        if _skip_marker():
-            raise RuntimeError("SKIP_MARKER/Windows default: bypass Marker, use PyMuPDF prose")
+        if _skip_marker(skip_marker=skip_marker, force_marker=force_marker):
+            raise RuntimeError("SKIP_MARKER default: bypass Marker, use PyMuPDF prose")
         _run_worker(payload, label="marker", timeout_s=MARKER_TIMEOUT_S)
         if out_md.is_file():
             return out_md.read_text(encoding="utf-8")

@@ -38,7 +38,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--skip-tables",
         action="store_true",
-        help="Fast test: Marker only, skip VLM/Paddle/grid (no GPU model load).",
+        help="Skip VLM/Paddle/grid table backends (text/prose only).",
+    )
+    parser.add_argument(
+        "--skip-marker",
+        action="store_true",
+        help="Skip Marker (default anyway on CPU). Use PyMuPDF prose + Paddle/VLM tables.",
+    )
+    parser.add_argument(
+        "--force-marker",
+        action="store_true",
+        help="Force-load Marker/Surya (slow; needs working torch). Overrides --skip-marker.",
     )
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging.")
     return parser
@@ -53,11 +63,20 @@ def main(argv: list[str] | None = None) -> int:
         logging.error("Input PDF not found: %s", pdf_path)
         return 1
 
+    skip_marker: bool | None = True if args.skip_marker else None
+    if args.force_marker:
+        skip_marker = False
+
     try:
-        result = UnifiedPDFPipeline().run(
+        result = UnifiedPDFPipeline(
+            skip_marker=skip_marker,
+            force_marker=args.force_marker,
+        ).run(
             pdf_path,
             output=args.output,
             skip_tables=args.skip_tables,
+            skip_marker=skip_marker,
+            force_marker=args.force_marker,
             write_docx=args.docx,
         )
     except Exception as exc:

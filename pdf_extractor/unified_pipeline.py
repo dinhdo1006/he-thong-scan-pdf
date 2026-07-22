@@ -39,11 +39,16 @@ from .grid_table_extractor import (
     detect_table_pages,
     extract_pdf_tables_to_excel,
 )
-from .isolated_backends import extract_markdown_isolated, extract_paddle_tables_isolated
+from .isolated_backends import (
+    _skip_marker,
+    extract_markdown_isolated,
+    extract_paddle_tables_isolated,
+)
 from .marker_extractor import MarkerExtractor
 from .markdown_parser import MarkdownBlockParser
 from .paddle_extractor import PaddleExtractionError
 from .paddle_extractor import extract as paddle_extract
+from .text_fallback import extract_plaintext_fallback, plaintext_as_markdown
 from .vlm_extractor import VLMConfig, VLMExtractionError, VLMTableExtractor
 
 logger = logging.getLogger(__name__)
@@ -106,25 +111,41 @@ class UnifiedPDFPipeline:
         marker_extractor: Optional[MarkerExtractor] = None,
         vlm_extractor: Optional[VLMTableExtractor] = None,
         table_settings: dict = DEFAULT_TABLE_SETTINGS,
+        *,
+        skip_marker: Optional[bool] = None,
+        force_marker: bool = False,
     ) -> None:
         self.marker = marker_extractor or MarkerExtractor()
         # Full-page by default -- scanned B06 forms lose the grid when cropped.
         self.vlm = vlm_extractor or VLMTableExtractor(VLMConfig(crop_to_table=False))
         self.table_settings = table_settings
+        self.skip_marker = skip_marker
+        self.force_marker = force_marker
 
     def _detect_table_pages(self, pdf_path: Path) -> List[int]:
         return detect_table_pages(pdf_path, table_settings=self.table_settings)
 
     def _extract_markdown(self, pdf_path: Path, work_dir: Path) -> str:
+        if _skip_marker(skip_marker=self.skip_marker, force_marker=self.force_marker):
+            logger.info(
+                "Skipping Marker (default on CPU / SKIP_MARKER). "
+                "Using PyMuPDF prose; tables still come from Paddle/VLM. "
+                "Set FORCE_MARKER=1 or pass --force-marker to enable Marker."
+            )
+            return plaintext_as_markdown(extract_plaintext_fallback(pdf_path))
+
         if _needs_process_isolation():
             logger.info("Windows: running Marker in an isolated subprocess (torch/paddle DLL split).")
-            return extract_markdown_isolated(pdf_path, work_dir)
+            return extract_markdown_isolated(
+                pdf_path,
+                work_dir,
+                skip_marker=False,
+                force_marker=True,
+            )
         try:
             return self.marker.extract_markdown(pdf_path)
         except Exception as exc:
             logger.warning("Marker failed (%s) -- using PyMuPDF text fallback.", exc)
-            from .text_fallback import extract_plaintext_fallback, plaintext_as_markdown
-
             return plaintext_as_markdown(extract_plaintext_fallback(pdf_path))
 
 
@@ -207,6 +228,8 @@ class UnifiedPDFPipeline:
         *,
         output_filename: str = DEFAULT_OUTPUT_TXT,
         skip_tables: bool = False,
+        skip_marker: Optional[bool] = None,
+        force_marker: bool = False,
         write_txt: bool = True,
         write_xlsx: bool = True,
         write_docx: bool = False,
@@ -217,6 +240,10 @@ class UnifiedPDFPipeline:
         Default deliverables: `output.txt` + `output_tables.xlsx`.
         Set `write_docx=True` (or pass a `.docx` `-o` path) for Word output.
         """
+        if skip_marker is not None:
+            self.skip_marker = skip_marker
+        if force_marker:
+            self.force_marker = True
         pdf_path = Path(pdf_path)
         if not pdf_path.is_file():
             raise FileNotFoundError(f"PDF not found: {pdf_path}")
