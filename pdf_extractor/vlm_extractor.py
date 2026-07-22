@@ -118,7 +118,10 @@ class VLMConfig:
           you want a small amount of controlled randomness.
     """
 
-    model_name: str = "Qwen/Qwen2-VL-7B-Instruct"
+    # 7B needs ~16+ GiB free for load+image; on 16 GiB cards prefer 2B unless
+    # the caller forces a larger model via CLI / env.
+    model_name: str = "Qwen/Qwen2-VL-2B-Instruct"
+    fallback_model_name: str = "Qwen/Qwen2-VL-2B-Instruct"
     device: str = "cuda"  # Assumes a GPU-equipped server, per deployment target.
     torch_dtype_name: str = "bfloat16"  # "bfloat16" preferred; falls back to "float16".
 
@@ -238,6 +241,25 @@ class VLMTableExtractor:
         self.config = config or VLMConfig()
         self._model: Any = None
         self._processor: Any = None
+        # After a load OOM, do not retry the same model on every page / crop pass.
+        self._load_failed: bool = False
+        self._load_error: Optional[str] = None
+
+    def unload(self) -> None:
+        """Drop model weights and free CUDA cache."""
+        import gc
+
+        self._model = None
+        self._processor = None
+        gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Lazy model loading
@@ -252,6 +274,11 @@ class VLMTableExtractor:
         """
         if self._model is not None:
             return
+        if self._load_failed:
+            raise VLMExtractionError(
+                self._load_error
+                or "VLM load previously failed (CUDA OOM). Skipping further VLM attempts."
+            )
 
         try:
             import torch
@@ -278,42 +305,89 @@ class VLMTableExtractor:
             torch.cuda.empty_cache()
 
         free_gib = None
+        total_gib = None
         if self.config.device == "cuda":
             free_bytes, total_bytes = torch.cuda.mem_get_info()
             free_gib = free_bytes / (1024**3)
+            total_gib = total_bytes / (1024**3)
             logger.info(
                 "GPU VRAM before VLM load: %.2f GiB free / %.2f GiB total",
                 free_gib,
-                total_bytes / (1024**3),
+                total_gib,
             )
 
-        logger.info(
-            "Loading VLM '%s' on %s (dtype=%s)...",
-            self.config.model_name,
-            self.config.device,
-            dtype,
+        model_candidates = [self.config.model_name]
+        # On ~16 GiB GPUs, 7B often OOMs during shard load; try 2B automatically.
+        if (
+            self.config.fallback_model_name
+            and self.config.fallback_model_name != self.config.model_name
+        ):
+            model_candidates.append(self.config.fallback_model_name)
+        elif (
+            total_gib is not None
+            and total_gib < 20
+            and "7B" in self.config.model_name
+            and self.config.fallback_model_name
+        ):
+            model_candidates.append(self.config.fallback_model_name)
+
+        # De-dupe while preserving order.
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for name in model_candidates:
+            if name not in seen:
+                seen.add(name)
+                ordered.append(name)
+
+        last_exc: Optional[Exception] = None
+        for model_name in ordered:
+            logger.info(
+                "Loading VLM '%s' on %s (dtype=%s)...",
+                model_name,
+                self.config.device,
+                dtype,
+            )
+            try:
+                self._model = Qwen2VLForConditionalGeneration.from_pretrained(
+                    model_name,
+                    torch_dtype=dtype,
+                    device_map=self.config.device,
+                )
+                self._processor = AutoProcessor.from_pretrained(model_name)
+                self.config.model_name = model_name
+                logger.info("VLM ready (%s).", model_name)
+                return
+            except torch.OutOfMemoryError as exc:
+                last_exc = exc
+                logger.warning(
+                    "CUDA OOM loading '%s' -- unloading partial weights and trying next model.",
+                    model_name,
+                )
+                self.unload()
+                continue
+            except Exception as exc:
+                last_exc = exc
+                logger.warning("Failed loading '%s': %s", model_name, exc)
+                self.unload()
+                continue
+
+        hint = (
+            f" Only ~{free_gib:.1f} GiB free / {total_gib:.1f} GiB total before load."
+            if free_gib is not None and total_gib is not None
+            else ""
         )
-        try:
-            self._model = Qwen2VLForConditionalGeneration.from_pretrained(
-                self.config.model_name,
-                torch_dtype=dtype,
-                device_map=self.config.device,
-            )
-        except torch.OutOfMemoryError as exc:
-            hint = (
-                f" Only ~{free_gib:.1f} GiB free before load."
-                if free_gib is not None
-                else ""
-            )
-            raise VLMExtractionError(
-                "CUDA OOM while loading the VLM."
-                + hint
-                + " Kill other GPU processes (`nvidia-smi`, then `kill -9 <PID>`), "
-                "or use a smaller model e.g. --model Qwen/Qwen2-VL-2B-Instruct. "
-                f"Original error: {exc}"
-            ) from exc
-        self._processor = AutoProcessor.from_pretrained(self.config.model_name)
-        logger.info("VLM ready.")
+        msg = (
+            "CUDA OOM / load failure while loading the VLM."
+            + hint
+            + " Tried: "
+            + ", ".join(ordered)
+            + ". Kill other GPU processes (`nvidia-smi`), or pass "
+            "--vlm-model Qwen/Qwen2-VL-2B-Instruct. "
+            f"Original error: {last_exc}"
+        )
+        self._load_failed = True
+        self._load_error = msg
+        raise VLMExtractionError(msg) from last_exc
 
     # ------------------------------------------------------------------
     # Prompting + inference
@@ -695,6 +769,9 @@ class VLMTableExtractor:
         """
         try:
             raw_text = self._run_inference(image)
+        except VLMExtractionError:
+            # Load/OOM failures must abort the whole VLM pass (do not retry per page).
+            raise
         except Exception as exc:  # pragma: no cover - defensive: GPU/runtime errors
             logger.warning("VLM inference failed on a page: %s", exc)
             return []
@@ -767,6 +844,9 @@ class VLMTableExtractor:
             raise
         except Exception as exc:
             raise VLMExtractionError(f"Failed to render '{pdf_path}' to images: {exc}") from exc
+
+        # Fail fast once if the model cannot load (avoid N pages × OOM retries).
+        self.load()
 
         dataframes: List[pd.DataFrame] = []
         for image in page_images:

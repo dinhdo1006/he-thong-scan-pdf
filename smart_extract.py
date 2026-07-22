@@ -50,6 +50,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Force-load Marker/Surya (slow; needs working torch). Overrides --skip-marker.",
     )
+    parser.add_argument(
+        "--vlm-model",
+        default=None,
+        help=(
+            "HuggingFace VLM id for table extraction. "
+            "Default: Qwen/Qwen2-VL-2B-Instruct (fits ~16 GiB GPUs). "
+            "Example larger: Qwen/Qwen2-VL-7B-Instruct"
+        ),
+    )
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging.")
     return parser
 
@@ -67,10 +76,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.force_marker:
         skip_marker = False
 
+    from pdf_extractor.vlm_extractor import VLMConfig, VLMTableExtractor
+
+    vlm_config = VLMConfig(crop_to_table=False)
+    if args.vlm_model:
+        vlm_config.model_name = args.vlm_model
+
     try:
         result = UnifiedPDFPipeline(
             skip_marker=skip_marker,
             force_marker=args.force_marker,
+            vlm_extractor=VLMTableExtractor(vlm_config),
         ).run(
             pdf_path,
             output=args.output,

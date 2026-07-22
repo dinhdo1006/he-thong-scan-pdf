@@ -187,7 +187,12 @@ class UnifiedPDFPipeline:
                     return dataframes, BACKEND_VLM
                 logger.warning("VLM returned no usable tables -- falling back to PaddleOCR.")
             except VLMExtractionError as exc:
+                # OOM / load failure: do NOT burn VRAM retrying crop with the same model.
                 logger.warning("VLM unavailable/failed (%s) -- falling back to PaddleOCR.", exc)
+                try:
+                    self.vlm.unload()
+                except Exception:
+                    pass
         else:
             logger.warning(
                 "No CUDA GPU detected -- skipping VLM and using PaddleOCR PP-StructureV3 first."
