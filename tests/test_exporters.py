@@ -145,10 +145,10 @@ class TestResolveOutputPath(unittest.TestCase):
             p = resolve_output_path(Path(tmp) / "out.docx")
             self.assertEqual(p.name, "out.docx")
 
-    def test_directory_gets_default_docx(self) -> None:
+    def test_directory_gets_default_txt(self) -> None:
         with TemporaryDirectory() as tmp:
-            p = resolve_output_path(Path(tmp) / "folder")
-            self.assertEqual(p.name, "output.docx")
+            p = resolve_output_path(Path(tmp) / "folder", default_name="output.txt")
+            self.assertEqual(p.name, "output.txt")
             self.assertEqual(p.parent.name, "folder")
 
 

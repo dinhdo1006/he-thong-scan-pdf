@@ -422,22 +422,36 @@ def assemble_document_blocks(
         assert isinstance(marker_df, pd.DataFrame)
 
         pick = _pick_best_extracted_index(marker_df, candidates)
-        if pick is None and extracted_tables and _headers_look_garbled(
+        marker_garbled = _headers_look_garbled(
             [_clean_cell_text(c) for c in marker_df.columns]
-        ):
-            # Garbled Marker header + unused extracted: take next unused by order.
+        )
+        if pick is None and marker_garbled and any(c is not None for c in candidates):
+            # Garbled Marker OCR soup: prefer image-backend table by order.
             for idx, cand in enumerate(candidates):
                 if cand is not None:
-                    pick = (idx, 0.5)
+                    pick = (idx, 0.4)
+                    logger.info(
+                        "Table block %d: forcing extracted[%d] over garbled Marker headers.",
+                        seen_marker_tables,
+                        idx,
+                    )
                     break
 
         if pick is None:
             df = marker_df
-            logger.debug(
-                "Table block %d: no safe extracted match -- keeping Marker grid %s.",
-                seen_marker_tables,
-                marker_df.shape,
-            )
+            if any(c is not None for c in candidates):
+                logger.warning(
+                    "Table block %d: extracted tables remain but shape mismatch "
+                    "and Marker headers look OK -- keeping Marker %s.",
+                    seen_marker_tables,
+                    marker_df.shape,
+                )
+            else:
+                logger.warning(
+                    "Table block %d: no extracted table left -- keeping Marker grid %s.",
+                    seen_marker_tables,
+                    marker_df.shape,
+                )
         else:
             idx, score = pick
             extracted = candidates[idx]
@@ -467,20 +481,25 @@ def assemble_document_blocks(
         df = _prepare_table_df(df, apply_ocr_cleanup=apply_ocr_cleanup)
         parts.append(AssembledBlock(kind="table", content=df))
 
-    if marker_table_count == 0:
-        for cand in candidates:
-            if cand is None:
-                continue
+    # Append unused extracted tables only when Marker had no table anchors OR
+    # Marker headers were garbled (image backend is the source of truth).
+    marker_garbled_any = any(
+        b.kind == "table"
+        and isinstance(b.content, pd.DataFrame)
+        and _headers_look_garbled([_clean_cell_text(c) for c in b.content.columns])
+        for b in blocks
+    )
+    for flag, cand in zip(used_flags, candidates):
+        if flag or cand is None:
+            continue
+        if marker_table_count == 0 or marker_garbled_any:
             df = _prepare_table_df(cand, apply_ocr_cleanup=apply_ocr_cleanup)
             parts.append(AssembledBlock(kind="table", content=df))
-    else:
-        leftover = sum(
-            1 for flag, cand in zip(used_flags, candidates) if not flag and cand is not None
-        )
-        if leftover:
+            logger.info("Appended leftover extracted table %s.", df.shape)
+        else:
             logger.info(
-                "Dropped %d unmatched extracted table(s) to preserve Marker reading order/form.",
-                leftover,
+                "Dropped unmatched extracted table %s to preserve Marker reading order.",
+                cand.shape,
             )
 
     return parts

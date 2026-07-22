@@ -66,8 +66,9 @@ Rules (apply to ANY table, any language, any layout -- never assume a named temp
 3. Preserve the exact column count of the printed grid in every row. Never merge two adjacent cells into one value -- two separate number cells must stay two separate <td> cells.
 4. A cell with no visible text is still a cell: use an empty <td></td>, never omit it. Never drop blank columns in the middle of a form.
 5. Keep the visual column positions: left-to-right order of <td> must match the printed form left-to-right.
-6. If a header cell visually spans multiple columns or rows, use colspan/rowspan on that <th> exactly as printed -- do not flatten it into one column.
-7. Return ONLY the <table>...</table> element(s). No markdown fences, no <html>/<body> wrapper, no commentary before or after.
+6. Keep hierarchical / outline row codes exactly as printed in the first columns (e.g. 1, 1.1, 1.1.1, II) -- each printed line is its own <tr>, never flatten parent/child rows into one cell.
+7. If a header cell visually spans multiple columns or rows, use colspan/rowspan on that <th> exactly as printed -- do not flatten it into one column.
+8. Return ONLY the <table>...</table> element(s). No markdown fences, no <html>/<body> wrapper, no commentary before or after.
 
 Example of the exact shape (structure only, not real content):
 <table>
@@ -123,7 +124,7 @@ class VLMConfig:
 
     # --- Generation parameters (see class docstring above for tuning advice) ---
     # Large / multi-column forms need more tokens; truncated JSON is worse than slower runs.
-    max_new_tokens: int = 4096
+    max_new_tokens: int = 8192
     temperature: float = 0.1
     do_sample: bool = False
 
@@ -131,11 +132,9 @@ class VLMConfig:
     # High-res rendering improves reading of small printed cells from the IMAGE
     # (we deliberately do not use the PDF's embedded text layer).
     render_dpi: int = 300
-    # Crop to the densest ruled-grid region (see grid_table_extractor.find_table_bbox)
-    # before sending the image to the VLM -- removes letterhead/signature/stamp
-    # noise so the model's limited attention focuses on the actual table. Falls
-    # back to the full page automatically when no such region is found.
-    crop_to_table: bool = True
+    # Default False for scanned full-page forms: aggressive crop often clips
+    # multi-header B06-style grids and the VLM returns nothing usable.
+    crop_to_table: bool = False
 
     # --- Prompt ---
     prompt: str = field(default=TABLE_EXTRACTION_PROMPT)
@@ -726,6 +725,8 @@ class VLMTableExtractor:
         pdf_path: str | Path,
         page_indices: Optional[List[int]] = None,
         apply_ocr_cleanup: bool = True,
+        *,
+        crop_to_table: Optional[bool] = None,
     ) -> List[pd.DataFrame]:
         """
         Extract tables from a specific subset of pages (0-based indices), in memory.
@@ -744,17 +745,23 @@ class VLMTableExtractor:
         Does NOT write any file -- callers own export (so the orchestrator
         can combine results from multiple backends into one workbook).
 
+        Args:
+            crop_to_table: Override `VLMConfig.crop_to_table` for this call.
+                Pass False to force full-page images (useful when the pixel
+                crop heuristic clips a scanned form incorrectly).
+
         Returns:
             Cleaned DataFrame(s) for every usable table found (may be empty).
         """
         pdf_path = Path(pdf_path)
+        use_crop = self.config.crop_to_table if crop_to_table is None else crop_to_table
 
         try:
             page_images = render_pdf_to_images(
                 pdf_path,
                 dpi=self.config.render_dpi,
                 page_indices=page_indices,
-                crop_to_table=self.config.crop_to_table,
+                crop_to_table=use_crop,
             )
         except FileNotFoundError:
             raise

@@ -3,13 +3,12 @@ Unified Generic Pipeline: content-driven orchestration for ANY input PDF.
 
 Every PDF goes through the same fixed sequence:
     Step A (always):     Marker           -> document Markdown (prose + anchors).
-    Step B (always):     pdfplumber scan  -> which pages contain a table.
-    Step C (if B found): VLM -> PaddleOCR -> pdfplumber grid (first usable wins).
+    Step B (always):     pdfplumber/visual scan -> which pages contain a table.
+    Step C (if B found): VLM (full page) -> VLM crop retry -> Paddle -> grid.
 
-Primary output: form-faithful `.docx` (prose + real Word tables in reading order).
-Also writes: `output_tables.xlsx` and a companion `output.txt` for debugging.
-If GPU/ML table backends fail, Marker's table blocks are kept so content is
-never silently dropped.
+Primary outputs: `output.txt` + `output_tables.xlsx` (form grids).
+Optional: `output.docx` with real Word tables.
+If GPU/ML table backends fail, Marker's table blocks are kept with a loud warning.
 """
 
 from __future__ import annotations
@@ -40,7 +39,7 @@ from .marker_extractor import MarkerExtractor
 from .markdown_parser import MarkdownBlockParser
 from .paddle_extractor import PaddleExtractionError
 from .paddle_extractor import extract as paddle_extract
-from .vlm_extractor import VLMExtractionError, VLMTableExtractor
+from .vlm_extractor import VLMConfig, VLMExtractionError, VLMTableExtractor
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +86,7 @@ def _run_grid_fallback(pdf_path: Path, out_dir: Path, table_settings: dict) -> L
 
 
 class UnifiedPDFPipeline:
-    """Content-driven orchestrator producing form-faithful `.docx` (+ xlsx/txt)."""
+    """Content-driven orchestrator: txt + xlsx primary, optional docx."""
 
     def __init__(
         self,
@@ -96,7 +95,8 @@ class UnifiedPDFPipeline:
         table_settings: dict = DEFAULT_TABLE_SETTINGS,
     ) -> None:
         self.marker = marker_extractor or MarkerExtractor()
-        self.vlm = vlm_extractor or VLMTableExtractor()
+        # Full-page by default -- scanned B06 forms lose the grid when cropped.
+        self.vlm = vlm_extractor or VLMTableExtractor(VLMConfig(crop_to_table=False))
         self.table_settings = table_settings
 
     def _detect_table_pages(self, pdf_path: Path) -> List[int]:
@@ -108,71 +108,94 @@ class UnifiedPDFPipeline:
         out_dir: Path,
         page_indices: List[int],
     ) -> Tuple[List[pd.DataFrame], str]:
+        # --- VLM full page (primary for scans) ---
         try:
-            dataframes = self.vlm.extract_pages(pdf_path, page_indices=page_indices)
+            logger.info("Table backend: trying VLM on page(s) %s (full page)...", [p + 1 for p in page_indices])
+            dataframes = self.vlm.extract_pages(
+                pdf_path, page_indices=page_indices, crop_to_table=False
+            )
             if dataframes:
-                logger.info(
-                    "VLM extracted %d table(s) from page(s) %s.",
-                    len(dataframes),
-                    [p + 1 for p in page_indices],
-                )
+                logger.info("VLM (full page) extracted %d table(s).", len(dataframes))
                 return dataframes, BACKEND_VLM
-            logger.warning("VLM ran but returned no usable tables -- falling back to PaddleOCR.")
+            logger.warning("VLM full-page returned 0 tables -- retrying with table-region crop.")
+            dataframes = self.vlm.extract_pages(
+                pdf_path, page_indices=page_indices, crop_to_table=True
+            )
+            if dataframes:
+                logger.info("VLM (cropped) extracted %d table(s).", len(dataframes))
+                return dataframes, BACKEND_VLM
+            logger.warning("VLM returned no usable tables -- falling back to PaddleOCR.")
         except VLMExtractionError as exc:
             logger.warning("VLM unavailable/failed (%s) -- falling back to PaddleOCR.", exc)
 
+        # --- PaddleOCR PP-Structure ---
         try:
+            logger.info("Table backend: trying PaddleOCR PP-Structure...")
             dataframes = _run_paddle_fallback(pdf_path, out_dir)
             if dataframes:
-                logger.info("PaddleOCR fallback extracted %d table(s).", len(dataframes))
+                logger.info("PaddleOCR extracted %d table(s).", len(dataframes))
                 return dataframes, BACKEND_PADDLE
-            logger.warning("PaddleOCR fallback found no tables -- falling back to pdfplumber grid extraction.")
+            logger.warning("PaddleOCR found no tables -- falling back to pdfplumber grid.")
         except PaddleExtractionError as exc:
             logger.warning(
-                "PaddleOCR fallback unavailable/failed (%s) -- falling back to pdfplumber grid extraction.", exc
+                "PaddleOCR unavailable/failed (%s) -- falling back to pdfplumber grid. "
+                "Install with: pip install paddlepaddle paddleocr",
+                exc,
             )
 
+        # --- pdfplumber lines (native/vector PDFs only; scans usually get 0) ---
+        logger.info("Table backend: trying pdfplumber ruled-line grid...")
         dataframes = _run_grid_fallback(pdf_path, out_dir, self.table_settings)
-        logger.info("pdfplumber grid fallback extracted %d table(s).", len(dataframes))
-        return dataframes, BACKEND_GRID
+        if dataframes:
+            logger.info("pdfplumber grid extracted %d table(s).", len(dataframes))
+            return dataframes, BACKEND_GRID
+
+        logger.error(
+            "All image/grid table backends returned 0 tables on page(s) %s. "
+            "Will fall back to Marker OCR tables (often garbled on scans).",
+            [p + 1 for p in page_indices],
+        )
+        return [], BACKEND_GRID
 
     def run(
         self,
         pdf_path: str | Path,
-        output: str | Path = DEFAULT_OUTPUT_DOCX,
+        output: str | Path = DEFAULT_OUTPUT_TXT,
         *,
-        output_filename: str = DEFAULT_OUTPUT_DOCX,
+        output_filename: str = DEFAULT_OUTPUT_TXT,
         skip_tables: bool = False,
         write_txt: bool = True,
         write_xlsx: bool = True,
+        write_docx: bool = False,
     ) -> UnifiedResult:
         """
-        Process one PDF and write form-faithful outputs.
+        Process one PDF.
 
-        Args:
-            pdf_path: Input PDF.
-            output: Output `.docx` path, or a directory (writes `output.docx` inside).
-                    Passing `.txt` still works (writes that txt as primary, plus docx sibling).
-            output_filename: File name when `output` is a directory.
-            skip_tables: Skip VLM/Paddle/grid (Marker text + Marker tables only).
-            write_txt: Also write companion `output.txt`.
-            write_xlsx: Also write `output_tables.xlsx` for structured tables.
+        Default deliverables: `output.txt` + `output_tables.xlsx`.
+        Set `write_docx=True` (or pass a `.docx` `-o` path) for Word output.
         """
         pdf_path = Path(pdf_path)
         if not pdf_path.is_file():
             raise FileNotFoundError(f"PDF not found: {pdf_path}")
 
         requested = Path(output).expanduser()
-        want_txt_primary = requested.suffix.lower() == ".txt"
+        suffix = requested.suffix.lower()
+        want_docx_primary = suffix == ".docx"
 
-        if want_txt_primary:
+        if suffix == ".docx":
+            docx_path = resolve_output_path(requested, default_name=DEFAULT_OUTPUT_DOCX)
+            work_dir = docx_path.parent
+            txt_path = work_dir / DEFAULT_OUTPUT_TXT
+            write_docx = True
+        elif suffix == ".txt":
             txt_path = resolve_output_path(requested, default_name=DEFAULT_OUTPUT_TXT)
             work_dir = txt_path.parent
             docx_path = work_dir / DEFAULT_OUTPUT_DOCX
         else:
-            docx_path = resolve_output_path(output, default_name=output_filename)
-            work_dir = docx_path.parent
+            work_dir = requested
+            work_dir.mkdir(parents=True, exist_ok=True)
             txt_path = work_dir / DEFAULT_OUTPUT_TXT
+            docx_path = work_dir / DEFAULT_OUTPUT_DOCX
 
         xlsx_path = work_dir / DEFAULT_OUTPUT_XLSX
 
@@ -195,39 +218,50 @@ class UnifiedPDFPipeline:
             self.marker.unload()
             dataframes, backend = self._extract_tables(pdf_path, work_dir, pages_with_tables)
             if not dataframes:
-                logger.error(
-                    "Table page(s) %s detected but every backend returned zero tables. "
-                    "Falling back to Marker's table blocks in the final document.",
-                    [p + 1 for p in pages_with_tables],
-                )
                 used_marker_fallback = True
                 backend = BACKEND_MARKER
+                logger.error(
+                    "BACKEND=marker fallback. Table quality will be poor on scanned forms. "
+                    "Check VLM (transformers/Qwen2-VL + CUDA) and/or: pip install paddlepaddle paddleocr"
+                )
 
-        docx_path, final_tables = export_document_from_markdown(
-            markdown, dataframes, docx_path, apply_ocr_cleanup=True
-        )
+        final_tables: List[pd.DataFrame] = []
+        written_docx: Optional[Path] = None
+        if write_docx or want_docx_primary:
+            written_docx, final_tables = export_document_from_markdown(
+                markdown, dataframes, docx_path, apply_ocr_cleanup=True
+            )
+        else:
+            from .exporters import assemble_document_blocks
+
+            blocks = assemble_document_blocks(markdown, dataframes, apply_ocr_cleanup=True)
+            final_tables = [
+                b.content for b in blocks if b.kind == "table" and isinstance(b.content, pd.DataFrame)
+            ]
 
         written_xlsx: Optional[Path] = None
         if write_xlsx:
-            written = export_tables_preview(final_tables, xlsx_path, write_csv=True, write_markdown=True)
+            written = export_tables_preview(
+                final_tables, xlsx_path, write_csv=True, write_markdown=False
+            )
             written_xlsx = written["xlsx"]
 
         written_txt: Optional[Path] = None
-        if write_txt or want_txt_primary:
+        if write_txt or not want_docx_primary:
             txt_content = compose_document_txt(markdown, dataframes, apply_ocr_cleanup=True)
             written_txt = save_unified_txt(txt_content, txt_path)
 
         marker_table_count = sum(1 for _ in MarkdownBlockParser().parse_blocks(markdown) if _.kind == "table")
         table_count = len(final_tables) if final_tables else marker_table_count
 
-        primary = txt_path if want_txt_primary else docx_path
+        primary = written_docx if want_docx_primary and written_docx else (written_txt or written_docx or xlsx_path)
         return UnifiedResult(
-            output_path=primary,
+            output_path=primary if primary is not None else txt_path,
             table_count=table_count,
             pages_with_tables=pages_with_tables,
             table_backend_used=backend,
             used_marker_table_fallback=used_marker_fallback,
-            docx_path=docx_path,
+            docx_path=written_docx,
             xlsx_path=written_xlsx,
             txt_path=written_txt,
         )
@@ -237,14 +271,19 @@ def _build_arg_parser():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Content-driven PDF pipeline -> form-faithful .docx (+ xlsx/txt)."
+        description="Content-driven PDF pipeline -> output.txt + output_tables.xlsx."
     )
     parser.add_argument("--input", "-i", required=True, help="Path to the input PDF file.")
     parser.add_argument(
         "--output",
         "-o",
-        default=DEFAULT_OUTPUT_DOCX,
-        help="Output .docx path, or a directory (writes output.docx inside).",
+        default=DEFAULT_OUTPUT_TXT,
+        help="Output .txt path, or a directory (writes output.txt + output_tables.xlsx).",
+    )
+    parser.add_argument(
+        "--docx",
+        action="store_true",
+        help="Also write output.docx with real Word tables.",
     )
     parser.add_argument(
         "--skip-tables",
@@ -256,31 +295,31 @@ def _build_arg_parser():
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    import logging as _logging
+    from .logging_config import configure_app_logging
 
     args = _build_arg_parser().parse_args(argv)
-    _logging.basicConfig(
-        level=_logging.DEBUG if args.verbose else _logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
+    configure_app_logging(verbose=args.verbose)
 
     try:
-        result = UnifiedPDFPipeline().run(args.input, output=args.output, skip_tables=args.skip_tables)
+        result = UnifiedPDFPipeline().run(
+            args.input, output=args.output, skip_tables=args.skip_tables, write_docx=args.docx
+        )
     except Exception as exc:
-        _logging.error("Pipeline failed: %s", exc)
+        logging.error("Pipeline failed: %s", exc)
         return 1
 
     print("Done.")
-    print(f"  DOCX:              {result.docx_path}")
+    if result.txt_path:
+        print(f"  Text:              {result.txt_path}")
     if result.xlsx_path:
         print(f"  Tables (xlsx):     {result.xlsx_path}")
-    if result.txt_path:
-        print(f"  Text (debug):      {result.txt_path}")
+    if result.docx_path:
+        print(f"  DOCX:              {result.docx_path}")
     if result.pages_with_tables:
         print(f"  Table page(s):     {[p + 1 for p in result.pages_with_tables]}")
         print(f"  Backend:           {result.table_backend_used}")
         if result.used_marker_table_fallback:
-            print("  Note: ML backends failed or skipped -- tables from Marker OCR.")
+            print("  WARNING: tables from Marker OCR only -- install/fix VLM or PaddleOCR.")
     else:
         print("  No tables detected in PDF structure scan.")
 
