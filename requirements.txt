@@ -7,7 +7,12 @@ Pillow>=10.0.0
 lxml>=5.0.0
 python-docx>=1.1.0
 
-# --- Local Vision-Language Model (VLM) table extraction (pdf_extractor/vlm_extractor.py) ---
+# --- IBM Docling TableFormer (offline table structure; pdf_extractor/docling_extractor.py) ---
+docling>=2.0.0
+docling-core>=2.0.0
+
+# --- Local Vision-Language Model (VLM) table extraction (DEPRECATED: pdf_extractor/vlm_extractor.py) ---
+# Prefer Docling above. These remain for legacy imports only.
 # Requires a CUDA-equipped GPU server. Install a torch build matching your
 # CUDA version -- see https://pytorch.org/get-started/locally/
 torch>=2.2.0
@@ -15,7 +20,7 @@ transformers>=4.45.0
 accelerate>=0.33.0
 qwen-vl-utils>=0.0.8
 
-# --- PaddleOCR PP-StructureV3 (CPU fallback when no CUDA for VLM) ---
+# --- PaddleOCR PP-StructureV3 (CPU fallback when Docling finds no tables) ---
 # Required on machines without NVIDIA GPU -- paddleocr 3.x uses PPStructureV3.
 paddlepaddle==3.2.2
 paddleocr>=3.0.0

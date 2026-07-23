@@ -137,23 +137,139 @@ def _engine_api() -> str:
 
 
 # ---------------------------------------------------------------------------
-# HTML -> DataFrame (keep cell text as strings)
+# HTML -> DataFrame (keep cell text as strings; no pandas numeric coercion)
 # ---------------------------------------------------------------------------
+def _normalize_cell(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).replace("\n", " ").strip()
+
+
+def _dedupe_columns(names: List[str]) -> List[str]:
+    seen: dict[str, int] = {}
+    out: List[str] = []
+    for name in names:
+        base = name or "Column"
+        if base not in seen:
+            seen[base] = 1
+            out.append(base)
+        else:
+            seen[base] += 1
+            out.append(f"{base}_{seen[base]}")
+    return out
+
+
+def _grid_to_dataframe(headers: List[Any], rows: List[Any]) -> Optional[pd.DataFrame]:
+    """Build a DataFrame from headers + list-of-lists body (all cells as strings)."""
+    if not isinstance(rows, list) or not rows:
+        if headers:
+            cols = [_normalize_cell(h) or f"Column_{i + 1}" for i, h in enumerate(headers)]
+            return pd.DataFrame(columns=_dedupe_columns(cols))
+        return None
+
+    width = max(
+        len(headers) if headers else 0,
+        max((len(r) for r in rows if isinstance(r, list)), default=0),
+    )
+    if width == 0:
+        return None
+
+    if headers and len(headers) == width:
+        cols = [_normalize_cell(h) or f"Column_{i + 1}" for i, h in enumerate(headers)]
+    elif headers:
+        cols = [_normalize_cell(h) or f"Column_{i + 1}" for i, h in enumerate(headers)]
+        while len(cols) < width:
+            cols.append(f"Column_{len(cols) + 1}")
+        cols = cols[:width]
+    else:
+        cols = [f"Column_{i + 1}" for i in range(width)]
+
+    cols = _dedupe_columns(cols)
+    normalized: List[List[str]] = []
+    for row in rows:
+        if not isinstance(row, list):
+            continue
+        cells = [_normalize_cell(c) for c in row]
+        if len(cells) < width:
+            cells = cells + [""] * (width - len(cells))
+        normalized.append(cells[:width])
+
+    if not normalized and not headers:
+        return None
+    return pd.DataFrame(normalized, columns=cols)
+
+
+def _html_table_to_grid(html_fragment: str) -> Optional[List[List[str]]]:
+    """Parse one ``<table>`` into a dense 2D grid, expanding colspan/rowspan."""
+    from lxml import html as lxml_html
+
+    try:
+        table_el = lxml_html.fromstring(html_fragment)
+    except Exception as exc:
+        logger.warning("lxml could not parse an HTML table fragment: %s", exc)
+        return None
+
+    row_elements = table_el.xpath(".//tr")
+    if not row_elements:
+        return None
+
+    grid: List[List[str]] = []
+    pending: dict[tuple[int, int], str] = {}
+    max_cols = 0
+
+    for row_index, tr in enumerate(row_elements):
+        while len(grid) <= row_index:
+            grid.append([])
+        col_index = 0
+        for cell in tr.xpath("./td|./th"):
+            while (row_index, col_index) in pending:
+                grid[row_index].append(pending.pop((row_index, col_index)))
+                col_index += 1
+            text = " ".join((cell.text_content() or "").split())
+            try:
+                colspan = max(1, int(cell.get("colspan", 1)))
+            except (TypeError, ValueError):
+                colspan = 1
+            try:
+                rowspan = max(1, int(cell.get("rowspan", 1)))
+            except (TypeError, ValueError):
+                rowspan = 1
+            for span_col in range(colspan):
+                grid[row_index].append(text)
+                for span_row in range(1, rowspan):
+                    pending[(row_index + span_row, col_index + span_col)] = text
+                col_index += 1
+        while (row_index, col_index) in pending:
+            grid[row_index].append(pending.pop((row_index, col_index)))
+            col_index += 1
+        max_cols = max(max_cols, len(grid[row_index]))
+
+    if max_cols == 0:
+        return None
+    for row in grid:
+        row.extend([""] * (max_cols - len(row)))
+    return grid
+
+
 def html_to_dataframe(html: str) -> Optional[pd.DataFrame]:
     """
-    Parse one HTML `<table>` into a DataFrame without numeric coercion.
+    Parse one HTML ``<table>`` into a DataFrame without numeric coercion.
 
-    Reuses the VLM extractor's colspan/rowspan-aware parser so "250.000"
-    is not silently turned into 250.0 by `pandas.read_html`.
+    Expands colspan/rowspan so values like ``250.000`` stay plain strings
+    (unlike ``pandas.read_html``).
     """
     if not html or not str(html).strip():
         return None
-    from .vlm_extractor import VLMTableExtractor
 
     fragment = str(html).strip()
     if "<table" not in fragment.lower():
         fragment = f"<table>{fragment}</table>"
-    return VLMTableExtractor._html_table_to_dataframe(fragment)
+
+    grid = _html_table_to_grid(fragment)
+    if not grid:
+        return None
+    headers, body = grid[0], grid[1:]
+    return _grid_to_dataframe(headers, body)
 
 
 def _pred_html_from_table_res(table_res: Any) -> Optional[str]:

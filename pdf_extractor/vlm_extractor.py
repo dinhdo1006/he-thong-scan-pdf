@@ -35,6 +35,15 @@ Pipeline:
 
 from __future__ import annotations
 
+import warnings
+
+warnings.warn(
+    "vlm_extractor.py is deprecated and will be removed. "
+    "Use pdf_extractor.docling_extractor instead.",
+    DeprecationWarning,
+    stacklevel=2,
+)
+
 import json
 import logging
 import re
@@ -181,48 +190,54 @@ def render_pdf_to_images(
     Returns:
         One PIL.Image (RGB) per requested page, in page order.
     """
-    import fitz  # PyMuPDF
+    # DEPRECATED — replaced by docling_extractor.py
+    raise NotImplementedError(
+        "vlm_extractor is deprecated; use pdf_extractor.docling_extractor"
+    )
+    
+    # --- original body (disabled) ---
+    # import fitz  # PyMuPDF
 
-    pdf_path = Path(pdf_path)
-    if not pdf_path.is_file():
-        raise FileNotFoundError(f"PDF not found: {pdf_path}")
+    # pdf_path = Path(pdf_path)
+    # if not pdf_path.is_file():
+    #     raise FileNotFoundError(f"PDF not found: {pdf_path}")
 
-    zoom = dpi / 72.0
-    matrix = fitz.Matrix(zoom, zoom)
+    # zoom = dpi / 72.0
+    # matrix = fitz.Matrix(zoom, zoom)
 
-    bbox_by_page: dict[int, Any] = {}
-    if crop_to_table:
-        from .grid_table_extractor import find_table_bbox
+    # bbox_by_page: dict[int, Any] = {}
+    # if crop_to_table:
+    #     from .grid_table_extractor import find_table_bbox
 
-        indices_for_bbox = page_indices if page_indices is not None else None
-        with fitz.open(pdf_path) as _probe:
-            probe_indices = indices_for_bbox if indices_for_bbox is not None else range(_probe.page_count)
-        for i in probe_indices:
-            try:
-                bbox = find_table_bbox(pdf_path, i)
-            except Exception as exc:  # pragma: no cover - defensive: rendering failure
-                logger.warning("Table bbox detection failed on page %d: %s", i + 1, exc)
-                bbox = None
-            if bbox is not None:
-                bbox_by_page[i] = bbox
+    #     indices_for_bbox = page_indices if page_indices is not None else None
+    #     with fitz.open(pdf_path) as _probe:
+    #         probe_indices = indices_for_bbox if indices_for_bbox is not None else range(_probe.page_count)
+    #     for i in probe_indices:
+    #         try:
+    #             bbox = find_table_bbox(pdf_path, i)
+    #         except Exception as exc:  # pragma: no cover - defensive: rendering failure
+    #             logger.warning("Table bbox detection failed on page %d: %s", i + 1, exc)
+    #             bbox = None
+    #         if bbox is not None:
+    #             bbox_by_page[i] = bbox
 
-    images: List[Image.Image] = []
-    doc = fitz.open(pdf_path)
-    try:
-        indices = page_indices if page_indices is not None else range(doc.page_count)
-        for i in indices:
-            page = doc[i]
-            clip = fitz.Rect(*bbox_by_page[i]) if i in bbox_by_page else None
-            pix = page.get_pixmap(matrix=matrix, colorspace=fitz.csRGB, clip=clip)
-            image = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-            images.append(image)
-            if clip is not None:
-                logger.info("Page %d: cropped to detected table region %s.", i + 1, tuple(round(v, 1) for v in clip))
-    finally:
-        doc.close()
+    # images: List[Image.Image] = []
+    # doc = fitz.open(pdf_path)
+    # try:
+    #     indices = page_indices if page_indices is not None else range(doc.page_count)
+    #     for i in indices:
+    #         page = doc[i]
+    #         clip = fitz.Rect(*bbox_by_page[i]) if i in bbox_by_page else None
+    #         pix = page.get_pixmap(matrix=matrix, colorspace=fitz.csRGB, clip=clip)
+    #         image = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+    #         images.append(image)
+    #         if clip is not None:
+    #             logger.info("Page %d: cropped to detected table region %s.", i + 1, tuple(round(v, 1) for v in clip))
+    # finally:
+    #     doc.close()
 
-    logger.info("Rendered %d page(s) from %s at %d DPI (page_indices=%s).", len(images), pdf_path, dpi, page_indices)
-    return images
+    # logger.info("Rendered %d page(s) from %s at %d DPI (page_indices=%s).", len(images), pdf_path, dpi, page_indices)
+    # return images
 
 
 # ---------------------------------------------------------------------------
@@ -239,28 +254,41 @@ class VLMTableExtractor:
     """
 
     def __init__(self, config: Optional[VLMConfig] = None) -> None:
+        # DEPRECATED — replaced by docling_extractor.py
         self.config = config or VLMConfig()
-        self._model: Any = None
-        self._processor: Any = None
-        # After a load OOM, do not retry the same model on every page / crop pass.
-        self._load_failed: bool = False
-        self._load_error: Optional[str] = None
+        self.model = None
+        self.processor = None
+        self._device = None
+        
+        # --- original body (disabled) ---
+        # self.config = config or VLMConfig()
+        # self._model: Any = None
+        # self._processor: Any = None
+        # # After a load OOM, do not retry the same model on every page / crop pass.
+        # self._load_failed: bool = False
+        # self._load_error: Optional[str] = None
 
     def unload(self) -> None:
         """Drop model weights and free CUDA cache."""
-        import gc
+        # DEPRECATED — replaced by docling_extractor.py
+        self.model = None
+        self.processor = None
+        self._device = None
+        
+        # --- original body (disabled) ---
+        # import gc
 
-        self._model = None
-        self._processor = None
-        gc.collect()
-        try:
-            import torch
+        # self._model = None
+        # self._processor = None
+        # gc.collect()
+        # try:
+        #     import torch
 
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.ipc_collect()
-        except Exception:
-            pass
+        #     if torch.cuda.is_available():
+        #         torch.cuda.empty_cache()
+        #         torch.cuda.ipc_collect()
+        # except Exception:
+        #     pass
 
     # ------------------------------------------------------------------
     # Lazy model loading
@@ -273,122 +301,128 @@ class VLMTableExtractor:
             VLMExtractionError: If `torch`/`transformers` are missing, or if
                 no CUDA device is available.
         """
-        if self._model is not None:
-            return
-        if self._load_failed:
-            raise VLMExtractionError(
-                self._load_error
-                or "VLM load previously failed (CUDA OOM). Skipping further VLM attempts."
-            )
-
-        try:
-            import torch
-            from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
-        except ImportError as exc:
-            raise VLMExtractionError(
-                "transformers/torch (and Qwen2-VL support) are not installed. "
-                "Run: pip install torch transformers accelerate qwen-vl-utils"
-            ) from exc
-
-        if self.config.device == "cuda" and not torch.cuda.is_available():
-            raise VLMExtractionError(
-                "VLMConfig.device='cuda' but no CUDA device is available on this machine."
-            )
-
-        # bfloat16 is preferred on modern (Ampere+) GPUs for better numerical
-        # stability than float16, at the same VRAM cost. Fall back gracefully
-        # if the requested dtype string is invalid.
-        dtype = getattr(torch, self.config.torch_dtype_name, torch.bfloat16)
-
-        # Clear leftover CUDA fragments (e.g. after Marker unload) before the
-        # large contiguous allocation that from_pretrained needs.
-        if self.config.device == "cuda":
-            torch.cuda.empty_cache()
-
-        free_gib = None
-        total_gib = None
-        if self.config.device == "cuda":
-            free_bytes, total_bytes = torch.cuda.mem_get_info()
-            free_gib = free_bytes / (1024**3)
-            total_gib = total_bytes / (1024**3)
-            logger.info(
-                "GPU VRAM before VLM load: %.2f GiB free / %.2f GiB total",
-                free_gib,
-                total_gib,
-            )
-
-        model_candidates = [self.config.model_name]
-        # On ~16 GiB GPUs, 7B often OOMs during shard load; try 2B automatically.
-        if (
-            self.config.fallback_model_name
-            and self.config.fallback_model_name != self.config.model_name
-        ):
-            model_candidates.append(self.config.fallback_model_name)
-        elif (
-            total_gib is not None
-            and total_gib < 20
-            and "7B" in self.config.model_name
-            and self.config.fallback_model_name
-        ):
-            model_candidates.append(self.config.fallback_model_name)
-
-        # De-dupe while preserving order.
-        seen: set[str] = set()
-        ordered: list[str] = []
-        for name in model_candidates:
-            if name not in seen:
-                seen.add(name)
-                ordered.append(name)
-
-        last_exc: Optional[Exception] = None
-        for model_name in ordered:
-            logger.info(
-                "Loading VLM '%s' on %s (dtype=%s)...",
-                model_name,
-                self.config.device,
-                dtype,
-            )
-            try:
-                self._model = Qwen2VLForConditionalGeneration.from_pretrained(
-                    model_name,
-                    torch_dtype=dtype,
-                    device_map=self.config.device,
-                )
-                self._processor = AutoProcessor.from_pretrained(model_name)
-                self.config.model_name = model_name
-                logger.info("VLM ready (%s).", model_name)
-                return
-            except torch.OutOfMemoryError as exc:
-                last_exc = exc
-                logger.warning(
-                    "CUDA OOM loading '%s' -- unloading partial weights and trying next model.",
-                    model_name,
-                )
-                self.unload()
-                continue
-            except Exception as exc:
-                last_exc = exc
-                logger.warning("Failed loading '%s': %s", model_name, exc)
-                self.unload()
-                continue
-
-        hint = (
-            f" Only ~{free_gib:.1f} GiB free / {total_gib:.1f} GiB total before load."
-            if free_gib is not None and total_gib is not None
-            else ""
+        # DEPRECATED — replaced by docling_extractor.py
+        raise NotImplementedError(
+            "vlm_extractor is deprecated; use pdf_extractor.docling_extractor"
         )
-        msg = (
-            "CUDA OOM / load failure while loading the VLM."
-            + hint
-            + " Tried: "
-            + ", ".join(ordered)
-            + ". Kill other GPU processes (`nvidia-smi`), or pass "
-            "--vlm-model Qwen/Qwen2-VL-2B-Instruct. "
-            f"Original error: {last_exc}"
-        )
-        self._load_failed = True
-        self._load_error = msg
-        raise VLMExtractionError(msg) from last_exc
+        
+        # --- original body (disabled) ---
+        # if self._model is not None:
+        #     return
+        # if self._load_failed:
+        #     raise VLMExtractionError(
+        #         self._load_error
+        #         or "VLM load previously failed (CUDA OOM). Skipping further VLM attempts."
+        #     )
+
+        # try:
+        #     import torch
+        #     from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+        # except ImportError as exc:
+        #     raise VLMExtractionError(
+        #         "transformers/torch (and Qwen2-VL support) are not installed. "
+        #         "Run: pip install torch transformers accelerate qwen-vl-utils"
+        #     ) from exc
+
+        # if self.config.device == "cuda" and not torch.cuda.is_available():
+        #     raise VLMExtractionError(
+        #         "VLMConfig.device='cuda' but no CUDA device is available on this machine."
+        #     )
+
+        # # bfloat16 is preferred on modern (Ampere+) GPUs for better numerical
+        # # stability than float16, at the same VRAM cost. Fall back gracefully
+        # # if the requested dtype string is invalid.
+        # dtype = getattr(torch, self.config.torch_dtype_name, torch.bfloat16)
+
+        # # Clear leftover CUDA fragments (e.g. after Marker unload) before the
+        # # large contiguous allocation that from_pretrained needs.
+        # if self.config.device == "cuda":
+        #     torch.cuda.empty_cache()
+
+        # free_gib = None
+        # total_gib = None
+        # if self.config.device == "cuda":
+        #     free_bytes, total_bytes = torch.cuda.mem_get_info()
+        #     free_gib = free_bytes / (1024**3)
+        #     total_gib = total_bytes / (1024**3)
+        #     logger.info(
+        #         "GPU VRAM before VLM load: %.2f GiB free / %.2f GiB total",
+        #         free_gib,
+        #         total_gib,
+        #     )
+
+        # model_candidates = [self.config.model_name]
+        # # On ~16 GiB GPUs, 7B often OOMs during shard load; try 2B automatically.
+        # if (
+        #     self.config.fallback_model_name
+        #     and self.config.fallback_model_name != self.config.model_name
+        # ):
+        #     model_candidates.append(self.config.fallback_model_name)
+        # elif (
+        #     total_gib is not None
+        #     and total_gib < 20
+        #     and "7B" in self.config.model_name
+        #     and self.config.fallback_model_name
+        # ):
+        #     model_candidates.append(self.config.fallback_model_name)
+
+        # # De-dupe while preserving order.
+        # seen: set[str] = set()
+        # ordered: list[str] = []
+        # for name in model_candidates:
+        #     if name not in seen:
+        #         seen.add(name)
+        #         ordered.append(name)
+
+        # last_exc: Optional[Exception] = None
+        # for model_name in ordered:
+        #     logger.info(
+        #         "Loading VLM '%s' on %s (dtype=%s)...",
+        #         model_name,
+        #         self.config.device,
+        #         dtype,
+        #     )
+        #     try:
+        #         self._model = Qwen2VLForConditionalGeneration.from_pretrained(
+        #             model_name,
+        #             torch_dtype=dtype,
+        #             device_map=self.config.device,
+        #         )
+        #         self._processor = AutoProcessor.from_pretrained(model_name)
+        #         self.config.model_name = model_name
+        #         logger.info("VLM ready (%s).", model_name)
+        #         return
+        #     except torch.OutOfMemoryError as exc:
+        #         last_exc = exc
+        #         logger.warning(
+        #             "CUDA OOM loading '%s' -- unloading partial weights and trying next model.",
+        #             model_name,
+        #         )
+        #         self.unload()
+        #         continue
+        #     except Exception as exc:
+        #         last_exc = exc
+        #         logger.warning("Failed loading '%s': %s", model_name, exc)
+        #         self.unload()
+        #         continue
+
+        # hint = (
+        #     f" Only ~{free_gib:.1f} GiB free / {total_gib:.1f} GiB total before load."
+        #     if free_gib is not None and total_gib is not None
+        #     else ""
+        # )
+        # msg = (
+        #     "CUDA OOM / load failure while loading the VLM."
+        #     + hint
+        #     + " Tried: "
+        #     + ", ".join(ordered)
+        #     + ". Kill other GPU processes (`nvidia-smi`), or pass "
+        #     "--vlm-model Qwen/Qwen2-VL-2B-Instruct. "
+        #     f"Original error: {last_exc}"
+        # )
+        # self._load_failed = True
+        # self._load_error = msg
+        # raise VLMExtractionError(msg) from last_exc
 
     # ------------------------------------------------------------------
     # Prompting + inference
@@ -783,35 +817,43 @@ class VLMTableExtractor:
         One page may yield multiple tables when several distinct grids are
         present.
         """
-        try:
-            raw_text = self._run_inference(image)
-        except VLMExtractionError:
-            # Load/OOM failures must abort the whole VLM pass (do not retry per page).
-            raise
-        except Exception as exc:  # pragma: no cover - defensive: GPU/runtime errors
-            logger.warning("VLM inference failed on a page: %s", exc)
-            return []
-
-        html_tables = self._parse_html_response(raw_text)
-        if html_tables:
-            return html_tables
-
-        payload = self._parse_json_response(raw_text)
-        if payload is not None:
-            json_tables = self._payload_to_dataframes(payload)
-            if json_tables:
-                return json_tables
-
-        logger.warning(
-            "VLM response had no parseable HTML or JSON table. Raw response (first 500 chars): %.500s",
-            raw_text,
-        )
+        # DEPRECATED — replaced by docling_extractor.py
         return []
+        
+        # --- original body (disabled) ---
+        # try:
+        #     raw_text = self._run_inference(image)
+        # except VLMExtractionError:
+        #     # Load/OOM failures must abort the whole VLM pass (do not retry per page).
+        #     raise
+        # except Exception as exc:  # pragma: no cover - defensive: GPU/runtime errors
+        #     logger.warning("VLM inference failed on a page: %s", exc)
+        #     return []
+
+        # html_tables = self._parse_html_response(raw_text)
+        # if html_tables:
+        #     return html_tables
+
+        # payload = self._parse_json_response(raw_text)
+        # if payload is not None:
+        #     json_tables = self._payload_to_dataframes(payload)
+        #     if json_tables:
+        #         return json_tables
+
+        # logger.warning(
+        #     "VLM response had no parseable HTML or JSON table. Raw response (first 500 chars): %.500s",
+        #     raw_text,
+        # )
+        # return []
 
     def extract_table_from_image(self, image: Image.Image) -> Optional[pd.DataFrame]:
         """Backward-compatible wrapper: first table on the page, or None."""
-        tables = self.extract_tables_from_image(image)
-        return tables[0] if tables else None
+        # DEPRECATED — replaced by docling_extractor.py
+        return None
+        
+        # --- original body (disabled) ---
+        # tables = self.extract_tables_from_image(image)
+        # return tables[0] if tables else None
 
     def extract_pages(
         self,
@@ -846,34 +888,38 @@ class VLMTableExtractor:
         Returns:
             Cleaned DataFrame(s) for every usable table found (may be empty).
         """
-        pdf_path = Path(pdf_path)
-        use_crop = self.config.crop_to_table if crop_to_table is None else crop_to_table
+        # DEPRECATED — replaced by docling_extractor.py
+        return []
+        
+        # --- original body (disabled) ---
+        # pdf_path = Path(pdf_path)
+        # use_crop = self.config.crop_to_table if crop_to_table is None else crop_to_table
 
-        try:
-            page_images = render_pdf_to_images(
-                pdf_path,
-                dpi=self.config.render_dpi,
-                page_indices=page_indices,
-                crop_to_table=use_crop,
-            )
-        except FileNotFoundError:
-            raise
-        except Exception as exc:
-            raise VLMExtractionError(f"Failed to render '{pdf_path}' to images: {exc}") from exc
+        # try:
+        #     page_images = render_pdf_to_images(
+        #         pdf_path,
+        #         dpi=self.config.render_dpi,
+        #         page_indices=page_indices,
+        #         crop_to_table=use_crop,
+        #     )
+        # except FileNotFoundError:
+        #     raise
+        # except Exception as exc:
+        #     raise VLMExtractionError(f"Failed to render '{pdf_path}' to images: {exc}") from exc
 
-        # Fail fast once if the model cannot load (avoid N pages × OOM retries).
-        self.load()
+        # # Fail fast once if the model cannot load (avoid N pages × OOM retries).
+        # self.load()
 
-        dataframes: List[pd.DataFrame] = []
-        for image in page_images:
-            for df in self.extract_tables_from_image(image):
-                if df is None or df.empty:
-                    continue
-                if apply_ocr_cleanup:
-                    df = clean_ocr_errors(df)
-                dataframes.append(df)
+        # dataframes: List[pd.DataFrame] = []
+        # for image in page_images:
+        #     for df in self.extract_tables_from_image(image):
+        #         if df is None or df.empty:
+        #             continue
+        #         if apply_ocr_cleanup:
+        #             df = clean_ocr_errors(df)
+        #         dataframes.append(df)
 
-        return self._stitch_continuation_tables(dataframes)
+        # return self._stitch_continuation_tables(dataframes)
 
     def extract(
         self,
@@ -898,9 +944,13 @@ class VLMTableExtractor:
             One cleaned DataFrame per page that yielded a usable table (may
             be an empty list -- not an error condition on its own).
         """
-        dataframes = self.extract_pages(pdf_path, page_indices=None, apply_ocr_cleanup=apply_ocr_cleanup)
-        self.export_to_excel(dataframes, output_path)
-        return dataframes
+        # DEPRECATED — replaced by docling_extractor.py
+        return []
+        
+        # --- original body (disabled) ---
+        # dataframes = self.extract_pages(pdf_path, page_indices=None, apply_ocr_cleanup=apply_ocr_cleanup)
+        # self.export_to_excel(dataframes, output_path)
+        # return dataframes
 
     # ------------------------------------------------------------------
     # Export
@@ -913,8 +963,14 @@ class VLMTableExtractor:
         Prefer opening `*_preview.md` or `*_table_*.csv` in VS Code;
         open `.xlsx` with LibreOffice / Excel.
         """
-        written = export_tables_preview(dataframes, output_path)
-        return written["xlsx"]
+        # DEPRECATED — replaced by docling_extractor.py
+        raise NotImplementedError(
+            "vlm_extractor is deprecated; use pdf_extractor.docling_extractor"
+        )
+        
+        # --- original body (disabled) ---
+        # written = export_tables_preview(dataframes, output_path)
+        # return written["xlsx"]
 
 
 # ---------------------------------------------------------------------------
@@ -926,10 +982,16 @@ _default_extractor: Optional[VLMTableExtractor] = None
 
 
 def _get_default_extractor() -> VLMTableExtractor:
-    global _default_extractor
-    if _default_extractor is None:
-        _default_extractor = VLMTableExtractor()
-    return _default_extractor
+    # DEPRECATED — replaced by docling_extractor.py
+    raise NotImplementedError(
+        "vlm_extractor is deprecated; use pdf_extractor.docling_extractor"
+    )
+    
+    # --- original body (disabled) ---
+    # global _default_extractor
+    # if _default_extractor is None:
+    #     _default_extractor = VLMTableExtractor()
+    # return _default_extractor
 
 
 def extract(
@@ -945,58 +1007,74 @@ def extract(
     loaded once) unless a custom `config` is supplied, in which case a
     dedicated, non-cached extractor is created for that call.
     """
-    extractor = VLMTableExtractor(config) if config is not None else _get_default_extractor()
-    return extractor.extract(pdf_path, output_path=output_path, apply_ocr_cleanup=apply_ocr_cleanup)
+    # DEPRECATED — replaced by docling_extractor.py
+    return []
+    
+    # --- original body (disabled) ---
+    # extractor = VLMTableExtractor(config) if config is not None else _get_default_extractor()
+    # return extractor.extract(pdf_path, output_path=output_path, apply_ocr_cleanup=apply_ocr_cleanup)
 
 
 # ---------------------------------------------------------------------------
 # CLI (standalone usage / debugging, independent of the router)
 # ---------------------------------------------------------------------------
 def _build_arg_parser():
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description=(
-            "Table extraction via a local Vision-Language Model (Qwen2-VL by "
-            "default), running on CUDA. No coordinates, no anchors, no "
-            "per-document configuration required."
-        )
+    # DEPRECATED — replaced by docling_extractor.py
+    raise NotImplementedError(
+        "vlm_extractor is deprecated; use pdf_extractor.docling_extractor"
     )
-    parser.add_argument("--input", "-i", required=True, help="Path to the input PDF file.")
-    parser.add_argument("--output", "-o", default=DEFAULT_OUTPUT_PATH, help="Path to the output .xlsx file.")
-    parser.add_argument("--model", default=VLMConfig.model_name, help="HuggingFace model id.")
-    parser.add_argument("--max-new-tokens", type=int, default=VLMConfig.max_new_tokens)
-    parser.add_argument("--temperature", type=float, default=VLMConfig.temperature)
-    parser.add_argument("--no-ocr-cleanup", action="store_true", help="Skip the OCR post-processing pass.")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging.")
-    return parser
+    
+    # --- original body (disabled) ---
+    # import argparse
+
+    # parser = argparse.ArgumentParser(
+    #     description=(
+    #         "Table extraction via a local Vision-Language Model (Qwen2-VL by "
+    #         "default), running on CUDA. No coordinates, no anchors, no "
+    #         "per-document configuration required."
+    #     )
+    # )
+    # parser.add_argument("--input", "-i", required=True, help="Path to the input PDF file.")
+    # parser.add_argument("--output", "-o", default=DEFAULT_OUTPUT_PATH, help="Path to the output .xlsx file.")
+    # parser.add_argument("--model", default=VLMConfig.model_name, help="HuggingFace model id.")
+    # parser.add_argument("--max-new-tokens", type=int, default=VLMConfig.max_new_tokens)
+    # parser.add_argument("--temperature", type=float, default=VLMConfig.temperature)
+    # parser.add_argument("--no-ocr-cleanup", action="store_true", help="Skip the OCR post-processing pass.")
+    # parser.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging.")
+    # return parser
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    args = _build_arg_parser().parse_args(argv)
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    # DEPRECATED — replaced by docling_extractor.py
+    raise SystemExit(
+        "vlm_extractor is deprecated; use pdf_extractor.docling_extractor"
     )
+    
+    # --- original body (disabled) ---
+    # args = _build_arg_parser().parse_args(argv)
+    # logging.basicConfig(
+    #     level=logging.DEBUG if args.verbose else logging.INFO,
+    #     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    # )
 
-    config = VLMConfig(
-        model_name=args.model,
-        max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
-    )
+    # config = VLMConfig(
+    #     model_name=args.model,
+    #     max_new_tokens=args.max_new_tokens,
+    #     temperature=args.temperature,
+    # )
 
-    try:
-        dataframes = VLMTableExtractor(config).extract(
-            args.input,
-            output_path=args.output,
-            apply_ocr_cleanup=not args.no_ocr_cleanup,
-        )
-    except (FileNotFoundError, VLMExtractionError) as exc:
-        logging.error(str(exc))
-        return 1
+    # try:
+    #     dataframes = VLMTableExtractor(config).extract(
+    #         args.input,
+    #         output_path=args.output,
+    #         apply_ocr_cleanup=not args.no_ocr_cleanup,
+    #     )
+    # except (FileNotFoundError, VLMExtractionError) as exc:
+    #     logging.error(str(exc))
+    #     return 1
 
-    print(f"Done. Exported {len(dataframes)} table(s) to {args.output}")
-    return 0
+    # print(f"Done. Exported {len(dataframes)} table(s) to {args.output}")
+    # return 0
 
 
 if __name__ == "__main__":

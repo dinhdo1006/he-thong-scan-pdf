@@ -38,26 +38,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--skip-tables",
         action="store_true",
-        help="Skip VLM/Paddle/grid table backends (text/prose only).",
+        help="Skip Docling/Paddle/grid table backends (text/prose only).",
     )
     parser.add_argument(
         "--skip-marker",
         action="store_true",
-        help="Skip Marker (default anyway on CPU). Use PyMuPDF prose + Paddle/VLM tables.",
+        help="Skip Marker (default anyway on CPU). Use PyMuPDF prose + Docling/Paddle tables.",
     )
     parser.add_argument(
         "--force-marker",
         action="store_true",
         help="Force-load Marker/Surya (slow; needs working torch). Overrides --skip-marker.",
-    )
-    parser.add_argument(
-        "--vlm-model",
-        default=None,
-        help=(
-            "HuggingFace VLM id for table extraction. "
-            "Default: Qwen/Qwen2-VL-2B-Instruct (fits ~16 GiB GPUs). "
-            "Example larger: Qwen/Qwen2-VL-7B-Instruct"
-        ),
     )
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging.")
     return parser
@@ -76,17 +67,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.force_marker:
         skip_marker = False
 
-    from pdf_extractor.vlm_extractor import VLMConfig, VLMTableExtractor
-
-    vlm_config = VLMConfig(crop_to_table=False)
-    if args.vlm_model:
-        vlm_config.model_name = args.vlm_model
-
     try:
         result = UnifiedPDFPipeline(
             skip_marker=skip_marker,
             force_marker=args.force_marker,
-            vlm_extractor=VLMTableExtractor(vlm_config),
         ).run(
             pdf_path,
             output=args.output,
@@ -110,7 +94,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  Table page(s):      {[p + 1 for p in result.pages_with_tables]}")
         print(f"  Backend:            {result.table_backend_used}")
         if result.used_marker_table_fallback:
-            print("  WARNING: Marker OCR fallback -- fix VLM/Paddle for real table quality.")
+            print("  WARNING: Marker OCR fallback -- fix Docling/Paddle for real table quality.")
         if result.table_count <= 0 or result.table_backend_used == "failed":
             print("  ERROR: detected table pages but extracted 0 tables.")
             return 2
