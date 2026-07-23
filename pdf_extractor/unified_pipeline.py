@@ -49,7 +49,15 @@ from .markdown_parser import MarkdownBlockParser
 from .paddle_extractor import PaddleExtractionError
 from .paddle_extractor import extract as paddle_extract
 from .text_fallback import extract_plaintext_fallback, plaintext_as_markdown
-from .docling_extractor import DoclingExtractionError, DoclingTableExtractor
+
+try:
+    from .docling_extractor import DoclingExtractionError, DoclingTableExtractor
+
+    _DOCLING_AVAILABLE = True
+except ImportError:  # pragma: no cover - optional dependency
+    DoclingExtractionError = RuntimeError  # type: ignore[misc, assignment]
+    DoclingTableExtractor = None  # type: ignore[misc, assignment]
+    _DOCLING_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -154,29 +162,35 @@ class UnifiedPDFPipeline:
         page_indices: List[int],
     ) -> Tuple[List[pd.DataFrame], str]:
         # --- Docling TableFormer (offline, CPU/GPU; primary table backend) ---
-        try:
-            logger.info(
-                "Table backend: trying Docling TableFormer on page(s) %s...",
-                [p + 1 for p in page_indices],
-            )
-            extractor = DoclingTableExtractor(pdf_path)
-            dataframes = extractor.extract()
-            if dataframes:
-                logger.info("Docling extracted %d table(s).", len(dataframes))
-                return dataframes, BACKEND_DOCLING
+        if not _DOCLING_AVAILABLE or DoclingTableExtractor is None:
             logger.warning(
-                "Docling returned 0 tables -- falling back to PaddleOCR."
+                "Docling is not installed -- skipping TableFormer. "
+                "Install with: pip install 'docling>=2.0.0' 'docling-core>=2.0.0'"
             )
-        except (DoclingExtractionError, FileNotFoundError, OSError, RuntimeError) as exc:
-            logger.warning(
-                "Docling unavailable/failed (%s) -- falling back to PaddleOCR.",
-                exc,
-            )
-        except Exception as exc:
-            logger.warning(
-                "Docling unavailable/failed (%s) -- falling back to PaddleOCR.",
-                exc,
-            )
+        else:
+            try:
+                logger.info(
+                    "Table backend: trying Docling TableFormer on page(s) %s...",
+                    [p + 1 for p in page_indices],
+                )
+                extractor = DoclingTableExtractor(pdf_path)
+                dataframes = extractor.extract()
+                if dataframes:
+                    logger.info("Docling extracted %d table(s).", len(dataframes))
+                    return dataframes, BACKEND_DOCLING
+                logger.warning(
+                    "Docling returned 0 tables -- falling back to PaddleOCR."
+                )
+            except (DoclingExtractionError, FileNotFoundError, OSError, RuntimeError) as exc:
+                logger.warning(
+                    "Docling unavailable/failed (%s) -- falling back to PaddleOCR.",
+                    exc,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Docling unavailable/failed (%s) -- falling back to PaddleOCR.",
+                    exc,
+                )
 
         # --- PaddleOCR PP-Structure (v3 on paddleocr>=3; works on CPU) ---
         try:
