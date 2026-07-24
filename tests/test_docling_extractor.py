@@ -13,7 +13,9 @@ from pdf_extractor.docling_extractor import (
     DoclingTableExtractor,
     _parse_marker_markdown_tables,
     _save_dataframes_to_excel,
+    _select_ocr_options,
     extract_tables_from_pdf,
+    flatten_docling_dataframe,
 )
 
 
@@ -136,3 +138,67 @@ def test_extract_tables_from_pdf_marker_fallback(tmp_path) -> None:
 def test_file_not_found() -> None:
     with pytest.raises(FileNotFoundError):
         DoclingTableExtractor("definitely_missing_file_xyz.pdf")
+
+
+# --- flatten_docling_dataframe ---------------------------------------------
+
+
+def test_flatten_docling_dataframe_multiindex_header() -> None:
+    columns = pd.MultiIndex.from_tuples(
+        [("Group", "A"), ("Group", "B"), ("Solo", "Solo")]
+    )
+    df = pd.DataFrame([["1", "2", "3"]], columns=columns)
+
+    flat = flatten_docling_dataframe(df, expected_cols=3)
+
+    assert list(flat.columns) == ["Group_A", "Group_B", "Solo"]
+    assert flat.iloc[0].tolist() == ["1", "2", "3"]
+
+
+def test_flatten_docling_dataframe_despans_repeated_body_values() -> None:
+    # A colspan cell echoes "Tổng cộng" into 3 physical columns; only the
+    # left-most one should keep the text after flattening.
+    df = pd.DataFrame(
+        [["1", "Mô tả", "Tổng cộng", "Tổng cộng", "Tổng cộng"]],
+        columns=["STT", "Mô_tả", "col_2", "col_3", "col_4"],
+    )
+
+    flat = flatten_docling_dataframe(df, expected_cols=5)
+
+    row = flat.iloc[0].tolist()
+    assert row[2] == "Tổng cộng"
+    assert pd.isna(row[3])
+    assert pd.isna(row[4])
+    assert len(flat.columns) == 5  # physical grid width is preserved
+
+
+def test_flatten_docling_dataframe_raises_on_column_mismatch() -> None:
+    df = pd.DataFrame([["1", "2", "3"]], columns=["A", "B", "C"])
+
+    with pytest.raises(ValueError):
+        flatten_docling_dataframe(df, expected_cols=9)
+
+
+def test_flatten_docling_dataframe_none_raises() -> None:
+    with pytest.raises(ValueError):
+        flatten_docling_dataframe(None, expected_cols=9)  # type: ignore[arg-type]
+
+
+# --- OCR engine selection ---------------------------------------------------
+
+
+def test_select_ocr_options_falls_back_to_none_without_engines() -> None:
+    with patch.dict("sys.modules", {"easyocr": None, "tesserocr": None, "pytesseract": None}):
+        result = _select_ocr_options(["vi"])
+    assert result is None
+
+
+def test_select_ocr_options_uses_easyocr_when_available() -> None:
+    import sys
+    import types
+
+    fake_easyocr = types.ModuleType("easyocr")
+    with patch.dict(sys.modules, {"easyocr": fake_easyocr}):
+        result = _select_ocr_options(["vi"])
+    assert result is not None
+    assert list(result.lang) == ["vi"]

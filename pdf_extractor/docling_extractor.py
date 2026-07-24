@@ -2,9 +2,16 @@
 Docling TableFormer table extractor (replaces ``vlm_extractor.py``).
 
 Uses IBM Docling offline for table structure recognition (TableFormer in
-ACCURATE mode). Multi-level headers with colspan/rowspan are converted into a
-pandas ``MultiIndex``. Results are written to ``output_tables.xlsx`` via
-openpyxl.
+ACCURATE mode) with native OCR enabled (EasyOCR, falling back to Tesseract)
+using explicit Vietnamese language codes. Running OCR gives TableFormer real
+text anchors instead of guessing column geometry blindly, and preserves
+diacritics (dấu thanh) that would otherwise be lost.
+
+Multi-level headers with colspan/rowspan are converted into a pandas
+``MultiIndex`` and then flattened + validated against the expected physical
+column count via ``flatten_docling_dataframe`` -- tables that don't match are
+dropped so the pipeline's Tier 2/3 cascade (PaddleOCR / pdfplumber) can take
+over. Results are written to ``output_tables.xlsx`` via openpyxl.
 """
 
 from __future__ import annotations
@@ -16,7 +23,14 @@ from typing import Any
 
 import pandas as pd
 from docling.datamodel.base_models import InputFormat
-from docling.datamodel.pipeline_options import PdfPipelineOptions, TableFormerMode
+from docling.datamodel.pipeline_options import (
+    EasyOcrOptions,
+    OcrOptions,
+    PdfPipelineOptions,
+    TableFormerMode,
+    TesseractCliOcrOptions,
+    TesseractOcrOptions,
+)
 from docling.document_converter import DocumentConverter, PdfFormatOption
 
 from .ocr_cleanup import clean_ocr_errors
@@ -25,6 +39,12 @@ logger = logging.getLogger(__name__)
 
 EXPECTED_COL_COUNT = 9  # Form B06 has 9 columns
 
+# Vietnamese language codes for the two OCR engine families Docling supports.
+# EasyOCR uses ISO 639-1 ("vi"); Tesseract uses the 3-letter ISO 639-2 code
+# ("vie") plus its language pack must be installed separately.
+DEFAULT_EASYOCR_LANG = ["vi"]
+DEFAULT_TESSERACT_LANG = ["vie"]
+
 
 class DoclingExtractionError(RuntimeError):
     """Raised when Docling fails to process the PDF."""
@@ -32,26 +52,233 @@ class DoclingExtractionError(RuntimeError):
     pass
 
 
-def _build_pipeline_options() -> PdfPipelineOptions:
-    """Build PdfPipelineOptions for offline TableFormer structure recognition."""
+def _select_ocr_options(easyocr_lang: list[str] | None = None) -> OcrOptions | None:
+    """
+    Pick the best available OCR engine for scanned Vietnamese PDFs.
+
+    TableFormer only *guesses* column geometry when it has no text anchors
+    to lock onto (``do_ocr=False``) -- this is the root cause of "Column
+    Collapse" on scanned B06-THA forms. Enabling native OCR with an explicit
+    Vietnamese language code gives TableFormer real text anchors and
+    preserves diacritics (dấu thanh) that a language-agnostic OCR pass
+    would otherwise strip.
+
+    Tries EasyOCR first (bundles its own language models, no external
+    binary required), then falls back to Tesseract (tesserocr, then the
+    CLI wrapper) if EasyOCR is not installed.
+
+    Returns:
+        A configured ``OcrOptions`` instance, or ``None`` if no OCR engine
+        is available (caller should then disable OCR and log loudly).
+    """
+    easyocr_lang = easyocr_lang or DEFAULT_EASYOCR_LANG
+
+    try:
+        import easyocr  # noqa: F401
+
+        logger.info("OCR engine: EasyOCR (lang=%s).", easyocr_lang)
+        return EasyOcrOptions(lang=easyocr_lang, force_full_page_ocr=False)
+    except ImportError:
+        logger.info("easyocr not installed -- trying Tesseract for Vietnamese OCR.")
+
+    try:
+        import tesserocr  # noqa: F401
+
+        logger.info("OCR engine: Tesseract (tesserocr, lang=%s).", DEFAULT_TESSERACT_LANG)
+        return TesseractOcrOptions(lang=DEFAULT_TESSERACT_LANG)
+    except ImportError:
+        pass
+
+    try:
+        import pytesseract  # noqa: F401
+
+        logger.info("OCR engine: Tesseract (CLI, lang=%s).", DEFAULT_TESSERACT_LANG)
+        return TesseractCliOcrOptions(lang=DEFAULT_TESSERACT_LANG)
+    except ImportError:
+        pass
+
+    logger.error(
+        "No OCR engine found (tried easyocr, tesserocr, pytesseract). Docling "
+        "will fall back to do_ocr=False -- diacritics on scanned PDFs WILL be "
+        "lost and TableFormer will guess column geometry blindly. Install one "
+        "with: pip install easyocr  (or Tesseract-OCR + the 'vie' language pack)."
+    )
+    return None
+
+
+def _build_pipeline_options(*, ocr_lang: list[str] | None = None) -> PdfPipelineOptions:
+    """
+    Build PdfPipelineOptions with native OCR + Vietnamese text anchors enabled.
+
+    ``do_table_structure=True`` keeps TableFormer in ACCURATE mode.
+    ``do_ocr=True`` (with a Vietnamese-aware engine) gives TableFormer real
+    text anchors instead of blind geometry guesses, which is the root cause
+    of "Column Collapse" on scanned B06-THA forms.
+    """
     options = PdfPipelineOptions()
     options.do_table_structure = True
     options.table_structure_options.mode = TableFormerMode.ACCURATE
-    # OCR is handled separately by the existing pipeline; Docling is used
-    # here ONLY for table structure recognition, not for text extraction.
-    options.do_ocr = False
+
+    ocr_options = _select_ocr_options(ocr_lang)
+    if ocr_options is not None:
+        options.do_ocr = True
+        options.ocr_options = ocr_options
+    else:
+        # Degrade gracefully instead of crashing the whole pipeline when no
+        # OCR engine is installed -- Tier 2/3 fallbacks still apply.
+        options.do_ocr = False
     return options
+
+
+def _flatten_header_tuple(levels: tuple[Any, ...]) -> str:
+    """Join one MultiIndex column's levels into a single string, in order."""
+    parts: list[str] = []
+    for level in levels:
+        text = "" if level is None else str(level).strip()
+        if not text or text.lower().startswith("unnamed:"):
+            continue
+        if parts and parts[-1] == text:
+            # Same label repeated top-to-bottom (colspan/rowspan echo) —
+            # keep it once instead of "Group_Group".
+            continue
+        parts.append(text)
+    return "_".join(parts) if parts else "col"
+
+
+def _is_blank(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, float) and pd.isna(value):
+        return True
+    return str(value).strip() == ""
+
+
+def _cells_equal(a: Any, b: Any) -> bool:
+    if _is_blank(a) or _is_blank(b):
+        return False
+    return str(a).strip() == str(b).strip()
+
+
+def _degap_spanned_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Remove colspan-echo duplicates from body rows without changing shape.
+
+    Docling (and pandas' own MultiIndex expansion) repeats a spanning
+    cell's text into every physical column it covers. Keep that text only
+    in the left-most column of each run of identical, non-empty, adjacent
+    values and blank out the rest with ``NaN`` — this is what keeps the
+    *physical* column count intact instead of letting the span visually
+    "collapse" the grid.
+    """
+    n_cols = len(df.columns)
+    if n_cols < 2 or df.empty:
+        return df
+
+    out = df.copy()
+    for row_pos in range(len(out)):
+        run_start = 0
+        for col_pos in range(1, n_cols + 1):
+            still_running = (
+                col_pos < n_cols
+                and _cells_equal(
+                    out.iat[row_pos, col_pos], out.iat[row_pos, run_start]
+                )
+            )
+            if still_running:
+                continue
+            if col_pos - run_start > 1:
+                for dup_pos in range(run_start + 1, col_pos):
+                    out.iat[row_pos, dup_pos] = None
+            run_start = col_pos
+    return out
+
+
+def flatten_docling_dataframe(
+    df: pd.DataFrame, expected_cols: int = EXPECTED_COL_COUNT
+) -> pd.DataFrame:
+    """
+    Flatten a Docling table DataFrame (e.g. from ``TableItem.export_to_dataframe()``)
+    into a fixed-width, single-level grid.
+
+    Docling represents multi-row headers with colspan/rowspan as a pandas
+    ``MultiIndex`` on the columns. Naively flattening that MultiIndex (or
+    de-duplicating repeated span labels) can silently drop physically
+    distinct columns — this is the "Column Collapse" bug seen on scanned
+    B06-THA forms. This function fixes that in two steps and then validates
+    the result:
+
+    1. **Header flatten** — every MultiIndex column tuple is joined into one
+       string (e.g. ``("Group", "A")`` -> ``"Group_A"``), skipping empty /
+       ``Unnamed: *`` / immediately-repeated levels. The *number* of columns
+       is never altered by this step, even when two tuples render to the
+       same joined string (a genuine colspan) — pandas keeps them as
+       distinct positional columns.
+    2. **Body de-span** — a spanning cell's text is echoed into every
+       column it physically covers. Only the left-most occurrence in each
+       row keeps the text; the rest are set to ``NaN`` so the grid keeps
+       exact column alignment for positional consumers (``table_layout.py``,
+       ``ocr_cleanup.py``).
+
+    Args:
+        df: A DataFrame as returned by Docling's table export, or any
+            DataFrame with a (possibly MultiIndex) column header.
+        expected_cols: The known physical column count for the target form
+            (defaults to 9, i.e. Form B06-THA).
+
+    Returns:
+        A new DataFrame with single-level string columns and exactly
+        ``expected_cols`` columns.
+
+    Raises:
+        ValueError: If the flattened grid does not have exactly
+            ``expected_cols`` columns — signals the caller's extraction
+            cascade to fall back to PaddleOCR instead of shipping a
+            misaligned grid.
+    """
+    if df is None:
+        raise ValueError("flatten_docling_dataframe() received None, expected a DataFrame")
+
+    flat = df.copy()
+
+    if isinstance(flat.columns, pd.MultiIndex):
+        flat.columns = [_flatten_header_tuple(t) for t in flat.columns.tolist()]
+    else:
+        flat.columns = [str(c) for c in flat.columns]
+
+    flat = _degap_spanned_rows(flat)
+
+    n_cols = len(flat.columns)
+    if n_cols != expected_cols:
+        raise ValueError(
+            f"Flattened Docling table has {n_cols} column(s), expected "
+            f"{expected_cols}. Physical grid is likely misaligned by an "
+            "unresolved colspan/rowspan."
+        )
+
+    return flat
 
 
 class DoclingTableExtractor:
     """Extract tables from a PDF using Docling TableFormer (offline)."""
 
-    def __init__(self, pdf_path: str | pathlib.Path) -> None:
+    def __init__(
+        self,
+        pdf_path: str | pathlib.Path,
+        *,
+        ocr_lang: list[str] | None = None,
+        expected_cols: int = EXPECTED_COL_COUNT,
+    ) -> None:
         """
         Initialize the extractor for a single PDF.
 
         Args:
             pdf_path: Path to the input PDF file.
+            ocr_lang: EasyOCR language codes to use (defaults to
+                ``["vi"]``). Ignored if EasyOCR is unavailable and Docling
+                falls back to Tesseract, which always uses ``["vie"]``.
+            expected_cols: Physical column count the flattened grid must
+                match; mismatches raise ``ValueError`` during ``extract()``
+                so the caller's cascade can fall back to PaddleOCR.
 
         Raises:
             FileNotFoundError: If ``pdf_path`` does not exist.
@@ -60,7 +287,8 @@ class DoclingTableExtractor:
         if not self._pdf_path.is_file():
             raise FileNotFoundError(f"PDF not found: {self._pdf_path}")
 
-        pipeline_options = _build_pipeline_options()
+        self._expected_cols = expected_cols
+        pipeline_options = _build_pipeline_options(ocr_lang=ocr_lang)
         self._converter = DocumentConverter(
             format_options={
                 InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
@@ -93,7 +321,16 @@ class DoclingTableExtractor:
         dataframes: list[pd.DataFrame] = []
         for table in tables:
             try:
-                dataframes.append(self._table_to_dataframe(table))
+                raw_df = self._table_to_dataframe(table)
+                dataframes.append(
+                    flatten_docling_dataframe(raw_df, expected_cols=self._expected_cols)
+                )
+            except ValueError as exc:
+                logger.warning(
+                    "Skipping table with misaligned grid (%s) -- letting the "
+                    "extraction cascade fall back to PaddleOCR.",
+                    exc,
+                )
             except Exception as exc:
                 logger.warning(
                     "Skipping table that failed DataFrame conversion: %s",
