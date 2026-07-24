@@ -52,6 +52,7 @@ from .paddle_extractor import extract as paddle_extract
 from .paddle_extractor import extract_with_pages as paddle_extract_with_pages
 from .text_fallback import extract_plaintext_fallback, plaintext_as_markdown
 from .table_quality import LOW_QUALITY_THRESHOLD, pick_better_table, score_table_quality
+from .semantic_validator import annotate_tables
 
 try:
     from .docling_extractor import DoclingExtractionError, DoclingTableExtractor
@@ -499,6 +500,10 @@ class UnifiedPDFPipeline:
                 len(dataframes),
             )
             final_tables = list(dataframes)
+
+        # Step D+ : semantic outline / sum validation before export.
+        if final_tables:
+            final_tables = annotate_tables(final_tables)
 
         written_xlsx: Optional[Path] = None
         if write_xlsx:
