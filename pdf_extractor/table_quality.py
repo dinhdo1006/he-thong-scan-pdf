@@ -41,47 +41,113 @@ def _cell_text(value: object) -> str:
     return text
 
 
-def score_table_quality(df: pd.DataFrame | None) -> float:
+def score_table_quality(
+    df: pd.DataFrame | None,
+    *,
+    return_breakdown: bool = False,
+) -> float | tuple[float, dict]:
     """
     Return a 0..1 quality score for a table grid (higher is better).
 
     Heuristics are form-agnostic: they penalize garbled headers and reward
     a reasonable non-empty body fill rate. They do NOT assume a fixed
     column count or header template.
+
+    Args:
+        df: Table grid to score.
+        return_breakdown: When True, also return a dict of score components
+            for DEBUG logging (scoring math is unchanged).
+
+    Returns:
+        ``score`` (float), or ``(score, breakdown)`` when
+        ``return_breakdown=True``.
     """
+    breakdown: dict = {
+        "early_exit": None,
+        "base": 0.55,
+        "n_rows": 0,
+        "n_cols": 0,
+        "empty_header_penalty": 0.0,
+        "garbage_header_penalty": 0.0,
+        "long_header_penalty": 0.0,
+        "weird_short_header_penalty": 0.0,
+        "underscore_soup_penalty": 0.0,
+        "empty_body_penalty": 0.0,
+        "fill_rate": 0.0,
+        "fill_bonus": 0.0,
+        "width_structure_bonus": 0.0,
+        "raw_before_clamp": 0.0,
+        "score": 0.0,
+    }
+
     if df is None or len(getattr(df, "columns", [])) == 0:
+        breakdown["early_exit"] = "none_or_zero_columns"
+        breakdown["score"] = 0.0
+        if return_breakdown:
+            return 0.0, breakdown
         return 0.0
 
     score = 0.55
     cols = [_cell_text(c) for c in df.columns]
+    breakdown["n_rows"] = int(df.shape[0])
+    breakdown["n_cols"] = int(len(cols))
+
+    empty_header_penalty = 0.0
+    garbage_header_penalty = 0.0
+    long_header_penalty = 0.0
+    weird_short_header_penalty = 0.0
+    underscore_soup_penalty = 0.0
 
     for col in cols:
         if not col:
             score -= 0.04
+            empty_header_penalty -= 0.04
             continue
         if _GARBAGE_HEADER_RE.search(col) or col.count("|") >= 2:
             score -= 0.25
+            garbage_header_penalty -= 0.25
         if len(col) > 70:
             score -= 0.18
+            long_header_penalty -= 0.18
         elif len(col) > 40:
             score -= 0.08
+            long_header_penalty -= 0.08
         if len(col) <= 2 and _WEIRD_SHORT_RE.match(col):
             score -= 0.06
+            weird_short_header_penalty -= 0.06
         # Collapsed multi-header soup often joins levels with underscores.
         if col.count("_") >= 3 and len(col) > 25:
             score -= 0.12
+            underscore_soup_penalty -= 0.12
+
+    breakdown["empty_header_penalty"] = empty_header_penalty
+    breakdown["garbage_header_penalty"] = garbage_header_penalty
+    breakdown["long_header_penalty"] = long_header_penalty
+    breakdown["weird_short_header_penalty"] = weird_short_header_penalty
+    breakdown["underscore_soup_penalty"] = underscore_soup_penalty
 
     if df.empty:
         score -= 0.15
+        breakdown["empty_body_penalty"] = -0.15
     else:
         total = int(df.shape[0] * df.shape[1])
         nonempty = sum(1 for v in df.to_numpy().ravel() if _cell_text(v))
         fill = nonempty / total if total else 0.0
-        score += 0.35 * fill
+        fill_bonus = 0.35 * fill
+        width_bonus = min(0.08, 0.008 * len(cols))
+        score += fill_bonus
         # Mild preference for having some structure, not for a magic width.
-        score += min(0.08, 0.008 * len(cols))
+        score += width_bonus
+        breakdown["fill_rate"] = fill
+        breakdown["fill_bonus"] = fill_bonus
+        breakdown["width_structure_bonus"] = width_bonus
 
-    return float(max(0.0, min(1.0, score)))
+    breakdown["raw_before_clamp"] = float(score)
+    final = float(max(0.0, min(1.0, score)))
+    breakdown["score"] = final
+    if return_breakdown:
+        return final, breakdown
+    return final
 
 
 def pick_better_table(

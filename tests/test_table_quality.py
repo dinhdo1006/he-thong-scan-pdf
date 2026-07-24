@@ -25,6 +25,22 @@ def test_score_penalizes_garbled_headers() -> None:
     assert score_table_quality(clean) > score_table_quality(dirty)
 
 
+def test_score_breakdown_matches_scalar_and_explains_zero_columns() -> None:
+    """return_breakdown must not change scoring math; only annotate components."""
+    clean = pd.DataFrame([["1", "x"]], columns=["STT", "Mo_ta"])
+    scalar = score_table_quality(clean)
+    scored, breakdown = score_table_quality(clean, return_breakdown=True)
+    assert scored == scalar
+    assert breakdown["score"] == scored
+    assert breakdown["early_exit"] is None
+    assert breakdown["n_cols"] == 2
+
+    empty = pd.DataFrame()
+    zero, empty_bd = score_table_quality(empty, return_breakdown=True)
+    assert zero == 0.0
+    assert empty_bd["early_exit"] == "none_or_zero_columns"
+
+
 def test_pick_better_table_prefers_cleaner() -> None:
     dirty = pd.DataFrame([["1"]], columns=["a|_b|_c " + ("z" * 80)])
     clean = pd.DataFrame([["1", "ok"]], columns=["A", "B"])

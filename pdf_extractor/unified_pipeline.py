@@ -217,11 +217,19 @@ class UnifiedPDFPipeline:
                 )
 
         missing_pages = [p for p in page_indices if p not in docling_by_page]
-        weak_pages = [
-            p
-            for p, df in docling_by_page.items()
-            if score_table_quality(df) < LOW_QUALITY_THRESHOLD
-        ]
+        weak_pages = []
+        for p, df in docling_by_page.items():
+            scored, breakdown = score_table_quality(df, return_breakdown=True)
+            if scored < LOW_QUALITY_THRESHOLD:
+                weak_pages.append(p)
+            logger.debug(
+                "Docling pre-Paddle page %d score=%.2f shape=%s breakdown=%s head=%s",
+                p + 1,
+                scored,
+                getattr(df, "shape", None),
+                breakdown,
+                df.head(5).to_dict("records") if df is not None and not df.empty else [],
+            )
         # Same document, wildly different widths usually means one page collapsed
         # (e.g. 9-col + 3-col) -- challenge with Paddle so stitch can align later.
         docling_widths = [len(df.columns) for df in docling_by_page.values()]
@@ -285,12 +293,41 @@ class UnifiedPDFPipeline:
                     chosen, winner = pick_better_table(d_df, p_df)
                     sources[page_no] = BACKEND_PADDLE if winner == "right" else BACKEND_DOCLING
                     merged[page_no] = chosen
+                    d_score, d_breakdown = score_table_quality(d_df, return_breakdown=True)
+                    p_score, p_breakdown = score_table_quality(p_df, return_breakdown=True)
                     logger.info(
                         "Page %d: Docling score=%.2f, Paddle score=%.2f -> %s",
                         page_no + 1,
-                        score_table_quality(d_df),
-                        score_table_quality(p_df),
+                        d_score,
+                        p_score,
                         sources[page_no],
+                    )
+                    # DEBUG-only: inspect why Docling may score ~0 without
+                    # changing pick/score math (enable with -v / --verbose).
+                    logger.debug(
+                        "Page %d Docling candidate shape=%s columns=%s",
+                        page_no + 1,
+                        getattr(d_df, "shape", None),
+                        [str(c) for c in list(d_df.columns)[:20]],
+                    )
+                    try:
+                        head_records = d_df.head(5).to_dict("records")
+                    except Exception as exc:  # pragma: no cover - defensive
+                        head_records = [{"_error": str(exc)}]
+                    logger.debug(
+                        "Page %d Docling head(5)=%s",
+                        page_no + 1,
+                        head_records,
+                    )
+                    logger.debug(
+                        "Page %d Docling score breakdown=%s",
+                        page_no + 1,
+                        d_breakdown,
+                    )
+                    logger.debug(
+                        "Page %d Paddle score breakdown=%s",
+                        page_no + 1,
+                        p_breakdown,
                     )
                 elif p_df is not None:
                     merged[page_no] = p_df
