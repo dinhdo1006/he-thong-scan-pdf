@@ -10,6 +10,8 @@ python-docx>=1.1.0
 # --- IBM Docling TableFormer (offline table structure; pdf_extractor/docling_extractor.py) ---
 docling>=2.0.0
 docling-core>=2.0.0
+# Native OCR engine for TableFormer text anchors + Vietnamese diacritics (lang=vi).
+easyocr>=1.7.0
 
 # --- Local Vision-Language Model (VLM) table extraction (DEPRECATED: pdf_extractor/vlm_extractor.py) ---
 # Prefer Docling above. These remain for legacy imports only.
