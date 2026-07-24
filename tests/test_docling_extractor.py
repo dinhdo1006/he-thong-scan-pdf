@@ -39,7 +39,10 @@ def _cell(
 
 
 def _fake_extractor(
-    *, header_row_count: int | None = None, expected_cols: int = 9
+    *,
+    header_row_count: int | None = None,
+    expected_cols: int | None = None,
+    strict_cols: bool = False,
 ) -> DoclingTableExtractor:
     """Build extractor without calling DocumentConverter / touching disk."""
     with patch.object(DoclingTableExtractor, "__init__", lambda self, pdf_path: None):
@@ -49,6 +52,7 @@ def _fake_extractor(
     ext._raw_result = None
     ext._header_row_count_override = header_row_count
     ext._expected_cols = expected_cols
+    ext._strict_cols = strict_cols
     return ext
 
 
@@ -195,13 +199,44 @@ def test_table_page_no_none_when_no_prov() -> None:
     assert DoclingTableExtractor._table_page_no(table) is None
 
 
-def test_extract_with_pages_keeps_valid_and_drops_misaligned_by_page() -> None:
-    """
-    One valid 3-col table on page 1 and one misaligned 2-col table (expects
-    3) on page 2 -- extract_with_pages() must keep the former, tagged with
-    its page, and drop the latter without touching the valid one.
-    """
-    ext = _fake_extractor(header_row_count=1, expected_cols=3)
+def test_extract_with_pages_keeps_any_width_by_default() -> None:
+    """Generic mode: tables of different widths are kept, not dropped."""
+    ext = _fake_extractor(header_row_count=1)
+
+    def _row(text, row, col, **kw):
+        return _cell(text, row=row, col=col, **kw)
+
+    good_grid = [
+        [_row("A", 0, 0, column_header=True), _row("B", 0, 1, column_header=True), _row("C", 0, 2, column_header=True)],
+        [_row("1", 1, 0), _row("2", 1, 1), _row("3", 1, 2)],
+    ]
+    narrow_grid = [
+        [_row("X", 0, 0, column_header=True), _row("Y", 0, 1, column_header=True)],
+        [_row("9", 1, 0), _row("8", 1, 1)],
+    ]
+    good_table = SimpleNamespace(
+        data=SimpleNamespace(num_cols=3, grid=good_grid),
+        prov=[SimpleNamespace(page_no=1)],
+    )
+    narrow_table = SimpleNamespace(
+        data=SimpleNamespace(num_cols=2, grid=narrow_grid),
+        prov=[SimpleNamespace(page_no=2)],
+    )
+    ext._raw_result = SimpleNamespace(
+        document=SimpleNamespace(tables=[good_table, narrow_table])
+    )
+    ext._converter = SimpleNamespace(convert=lambda _p: ext._raw_result)
+    ext._pdf_path = "fake.pdf"
+
+    results = ext.extract_with_pages()
+
+    assert len(results) == 2
+    assert results[0][0] == 0 and list(results[0][1].columns) == ["A", "B", "C"]
+    assert results[1][0] == 1 and list(results[1][1].columns) == ["X", "Y"]
+
+
+def test_extract_with_pages_strict_cols_drops_mismatch() -> None:
+    ext = _fake_extractor(header_row_count=1, expected_cols=3, strict_cols=True)
 
     def _row(text, row, col, **kw):
         return _cell(text, row=row, col=col, **kw)
@@ -231,9 +266,8 @@ def test_extract_with_pages_keeps_valid_and_drops_misaligned_by_page() -> None:
     results = ext.extract_with_pages()
 
     assert len(results) == 1
-    page_no, df = results[0]
-    assert page_no == 0  # page 1 -> 0-indexed
-    assert list(df.columns) == ["A", "B", "C"]
+    assert results[0][0] == 0
+    assert list(results[0][1].columns) == ["A", "B", "C"]
 
 
 # --- flatten_docling_dataframe ---------------------------------------------
@@ -268,11 +302,17 @@ def test_flatten_docling_dataframe_despans_repeated_body_values() -> None:
     assert len(flat.columns) == 5  # physical grid width is preserved
 
 
-def test_flatten_docling_dataframe_raises_on_column_mismatch() -> None:
+def test_flatten_docling_dataframe_warns_but_keeps_on_column_mismatch() -> None:
+    df = pd.DataFrame([["1", "2", "3"]], columns=["A", "B", "C"])
+    flat = flatten_docling_dataframe(df, expected_cols=9, strict_cols=False)
+    assert list(flat.columns) == ["A", "B", "C"]
+
+
+def test_flatten_docling_dataframe_raises_on_column_mismatch_when_strict() -> None:
     df = pd.DataFrame([["1", "2", "3"]], columns=["A", "B", "C"])
 
     with pytest.raises(ValueError):
-        flatten_docling_dataframe(df, expected_cols=9)
+        flatten_docling_dataframe(df, expected_cols=9, strict_cols=True)
 
 
 def test_flatten_docling_dataframe_none_raises() -> None:

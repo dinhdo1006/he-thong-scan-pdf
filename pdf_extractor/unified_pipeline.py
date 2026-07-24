@@ -51,6 +51,7 @@ from .paddle_extractor import PaddleExtractionError
 from .paddle_extractor import extract as paddle_extract
 from .paddle_extractor import extract_with_pages as paddle_extract_with_pages
 from .text_fallback import extract_plaintext_fallback, plaintext_as_markdown
+from .table_quality import LOW_QUALITY_THRESHOLD, pick_better_table, score_table_quality
 
 try:
     from .docling_extractor import DoclingExtractionError, DoclingTableExtractor
@@ -195,7 +196,10 @@ class UnifiedPDFPipeline:
                         docling_unplaced.append(df)
                     else:
                         docling_by_page[page_no] = df
-                logger.info("Docling extracted %d table(s).", len(docling_by_page) + len(docling_unplaced))
+                logger.info(
+                    "Docling extracted %d table(s).",
+                    len(docling_by_page) + len(docling_unplaced),
+                )
             except (DoclingExtractionError, FileNotFoundError, OSError, RuntimeError) as exc:
                 logger.warning(
                     "Docling unavailable/failed (%s) -- falling back to PaddleOCR.",
@@ -208,37 +212,80 @@ class UnifiedPDFPipeline:
                 )
 
         missing_pages = [p for p in page_indices if p not in docling_by_page]
+        weak_pages = [
+            p
+            for p, df in docling_by_page.items()
+            if score_table_quality(df) < LOW_QUALITY_THRESHOLD
+        ]
+        need_paddle = bool(missing_pages or weak_pages or not docling_by_page)
 
-        if docling_by_page and not missing_pages:
-            logger.info("Docling covered every detected table page -- no fallback needed.")
+        if docling_by_page and not need_paddle:
+            logger.info(
+                "Docling covered every detected table page with acceptable quality "
+                "-- no Paddle comparison needed."
+            )
             ordered = [docling_by_page[p] for p in sorted(docling_by_page)] + docling_unplaced
             return ordered, BACKEND_DOCLING
 
-        if docling_by_page and missing_pages:
+        if weak_pages:
             logger.warning(
-                "Docling covered %d/%d table page(s); page(s) %s missing/misaligned "
-                "-- filling gaps with PaddleOCR instead of dropping them.",
+                "Docling page(s) %s scored below quality threshold %.2f "
+                "-- running PaddleOCR for a form-agnostic comparison.",
+                [p + 1 for p in weak_pages],
+                LOW_QUALITY_THRESHOLD,
+            )
+        if missing_pages and docling_by_page:
+            logger.warning(
+                "Docling covered %d/%d table page(s); page(s) %s missing "
+                "-- filling gaps with PaddleOCR.",
                 len(docling_by_page),
                 len(page_indices),
                 [p + 1 for p in missing_pages],
             )
-        else:
-            missing_pages = list(page_indices)
+        elif not docling_by_page:
             logger.warning("Docling returned 0 usable tables -- falling back to PaddleOCR.")
 
-        # --- PaddleOCR PP-Structure (v3 on paddleocr>=3; works on CPU) ---
-        # Fills exactly the pages Docling could not, so a good Docling table
-        # is never thrown away just because another page needed a fallback.
+        # --- PaddleOCR PP-Structure: gap-fill + quality challenge ---
         try:
             logger.info("Table backend: trying PaddleOCR PP-Structure...")
             paddle_pages = _run_paddle_fallback_with_pages(pdf_path, out_dir)
-            merged = dict(docling_by_page)
-            for page_no, df in paddle_pages:
-                if page_no in missing_pages or page_no not in merged:
-                    merged[page_no] = df
+            paddle_by_page = {page_no: df for page_no, df in paddle_pages}
+            merged: Dict[int, pd.DataFrame] = {}
+            sources: Dict[int, str] = {}
+
+            all_pages = sorted(set(page_indices) | set(docling_by_page) | set(paddle_by_page))
+            for page_no in all_pages:
+                d_df = docling_by_page.get(page_no)
+                p_df = paddle_by_page.get(page_no)
+                if d_df is None and p_df is None:
+                    continue
+                if d_df is not None and p_df is not None:
+                    chosen, winner = pick_better_table(d_df, p_df)
+                    sources[page_no] = BACKEND_PADDLE if winner == "right" else BACKEND_DOCLING
+                    merged[page_no] = chosen
+                    logger.info(
+                        "Page %d: Docling score=%.2f, Paddle score=%.2f -> %s",
+                        page_no + 1,
+                        score_table_quality(d_df),
+                        score_table_quality(p_df),
+                        sources[page_no],
+                    )
+                elif p_df is not None:
+                    merged[page_no] = p_df
+                    sources[page_no] = BACKEND_PADDLE
+                else:
+                    merged[page_no] = d_df  # type: ignore[assignment]
+                    sources[page_no] = BACKEND_DOCLING
+
             still_missing = [p for p in page_indices if p not in merged]
             if merged:
-                backend = BACKEND_HYBRID if docling_by_page else BACKEND_PADDLE
+                used = set(sources.values())
+                if used == {BACKEND_DOCLING}:
+                    backend = BACKEND_DOCLING
+                elif used == {BACKEND_PADDLE}:
+                    backend = BACKEND_PADDLE
+                else:
+                    backend = BACKEND_HYBRID
                 if still_missing:
                     logger.error(
                         "Page(s) %s still have no valid table after Docling + "
@@ -247,7 +294,7 @@ class UnifiedPDFPipeline:
                         len(merged),
                     )
                 else:
-                    logger.info("PaddleOCR filled every remaining gap.")
+                    logger.info("Per-page quality merge complete (backend=%s).", backend)
                 ordered = [merged[p] for p in sorted(merged)] + docling_unplaced
                 return ordered, backend
             logger.warning("PaddleOCR found no tables -- falling back to pdfplumber grid.")

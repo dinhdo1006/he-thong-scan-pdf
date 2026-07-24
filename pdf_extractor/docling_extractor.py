@@ -37,13 +37,10 @@ from .ocr_cleanup import clean_ocr_errors
 
 logger = logging.getLogger(__name__)
 
-EXPECTED_COL_COUNT = 9  # Form B06 has 9 columns
-# Form B06-THA always has exactly 2 header rows: a group-label row (spanning
-# "Ủy thác THA" / "Trả đơn THA" / "Đình chỉ THA" / "Miễn, giảm THA" ...) and a
-# column-code row ("A B 1 2 3 4 5 6 7"). TableFormer's own `column_header`
-# classification is unreliable on low-quality scans -- it sometimes tags 5-6
-# leading rows as headers, which smears every label into a single garbled
-# column. Forcing this known value sidesteps that misclassification.
+# Optional hints only -- the extractor is form-agnostic. Callers that know a
+# specific template (e.g. B06-THA = 9 cols / 2 header rows) may still pass
+# these explicitly; they are NOT defaults that reject other tables.
+EXPECTED_COL_COUNT = 9
 EXPECTED_HEADER_ROWS = 2
 
 # Vietnamese language codes for the two OCR engine families Docling supports.
@@ -201,46 +198,35 @@ def _degap_spanned_rows(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def flatten_docling_dataframe(
-    df: pd.DataFrame, expected_cols: int = EXPECTED_COL_COUNT
+    df: pd.DataFrame,
+    expected_cols: int | None = None,
+    *,
+    strict_cols: bool = False,
 ) -> pd.DataFrame:
     """
-    Flatten a Docling table DataFrame (e.g. from ``TableItem.export_to_dataframe()``)
-    into a fixed-width, single-level grid.
+    Flatten a Docling table DataFrame into a single-level physical grid.
 
     Docling represents multi-row headers with colspan/rowspan as a pandas
-    ``MultiIndex`` on the columns. Naively flattening that MultiIndex (or
-    de-duplicating repeated span labels) can silently drop physically
-    distinct columns — this is the "Column Collapse" bug seen on scanned
-    B06-THA forms. This function fixes that in two steps and then validates
-    the result:
+    ``MultiIndex``. This function:
 
-    1. **Header flatten** — every MultiIndex column tuple is joined into one
-       string (e.g. ``("Group", "A")`` -> ``"Group_A"``), skipping empty /
-       ``Unnamed: *`` / immediately-repeated levels. The *number* of columns
-       is never altered by this step, even when two tuples render to the
-       same joined string (a genuine colspan) — pandas keeps them as
-       distinct positional columns.
-    2. **Body de-span** — a spanning cell's text is echoed into every
-       column it physically covers. Only the left-most occurrence in each
-       row keeps the text; the rest are set to ``NaN`` so the grid keeps
-       exact column alignment for positional consumers (``table_layout.py``,
-       ``ocr_cleanup.py``).
+    1. **Header flatten** — join MultiIndex levels into one string per column
+       without changing the physical column count.
+    2. **Body de-span** — keep spanning text only in the left-most cell of
+       each run; blank the echoed copies so alignment is preserved.
 
     Args:
-        df: A DataFrame as returned by Docling's table export, or any
-            DataFrame with a (possibly MultiIndex) column header.
-        expected_cols: The known physical column count for the target form
-            (defaults to 9, i.e. Form B06-THA).
+        df: Docling export (or any DataFrame with optional MultiIndex columns).
+        expected_cols: Optional width hint. When set and ``strict_cols`` is
+            True, a mismatch raises ``ValueError``. When ``strict_cols`` is
+            False (default), only a warning is logged — so tables of any
+            width remain usable (generic extraction, not form-locked).
+        strict_cols: If True and ``expected_cols`` is set, enforce exact width.
 
     Returns:
-        A new DataFrame with single-level string columns and exactly
-        ``expected_cols`` columns.
+        A DataFrame with single-level string columns (any width).
 
     Raises:
-        ValueError: If the flattened grid does not have exactly
-            ``expected_cols`` columns — signals the caller's extraction
-            cascade to fall back to PaddleOCR instead of shipping a
-            misaligned grid.
+        ValueError: If ``df`` is None, or if ``strict_cols`` and width mismatch.
     """
     if df is None:
         raise ValueError("flatten_docling_dataframe() received None, expected a DataFrame")
@@ -255,12 +241,17 @@ def flatten_docling_dataframe(
     flat = _degap_spanned_rows(flat)
 
     n_cols = len(flat.columns)
-    if n_cols != expected_cols:
-        raise ValueError(
+    if expected_cols is not None and n_cols != expected_cols:
+        msg = (
             f"Flattened Docling table has {n_cols} column(s), expected "
-            f"{expected_cols}. Physical grid is likely misaligned by an "
-            "unresolved colspan/rowspan."
+            f"{expected_cols}."
         )
+        if strict_cols:
+            raise ValueError(
+                msg + " Physical grid is likely misaligned by an unresolved "
+                "colspan/rowspan."
+            )
+        logger.warning("%s Keeping the table (generic mode; not form-locked).", msg)
 
     return flat
 
@@ -273,8 +264,9 @@ class DoclingTableExtractor:
         pdf_path: str | pathlib.Path,
         *,
         ocr_lang: list[str] | None = None,
-        expected_cols: int = EXPECTED_COL_COUNT,
-        header_row_count: int | None = EXPECTED_HEADER_ROWS,
+        expected_cols: int | None = None,
+        header_row_count: int | None = None,
+        strict_cols: bool = False,
     ) -> None:
         """
         Initialize the extractor for a single PDF.
@@ -284,15 +276,14 @@ class DoclingTableExtractor:
             ocr_lang: EasyOCR language codes to use (defaults to
                 ``["vi"]``). Ignored if EasyOCR is unavailable and Docling
                 falls back to Tesseract, which always uses ``["vie"]``.
-            expected_cols: Physical column count the flattened grid must
-                match; mismatches raise ``ValueError`` during ``extract()``
-                so the caller's cascade can fall back to PaddleOCR.
-            header_row_count: Fixed number of leading grid rows to treat as
-                the column header, overriding TableFormer's own (unreliable
-                on low-quality scans) ``column_header`` classification.
-                Defaults to ``EXPECTED_HEADER_ROWS`` (2, matching Form
-                B06-THA). Pass ``None`` to fall back to TableFormer's
-                auto-detected header rows instead.
+            expected_cols: Optional width hint for logging / strict checks.
+                Default ``None`` accepts any column count (generic tables).
+            header_row_count: Optional fixed header depth. Default ``None``
+                uses TableFormer's ``column_header`` auto-detect so forms
+                with 1 or N header rows still work. Pass an int only when
+                a known template needs an override.
+            strict_cols: When True with ``expected_cols``, drop tables whose
+                flattened width mismatches (legacy form-locked behavior).
 
         Raises:
             FileNotFoundError: If ``pdf_path`` does not exist.
@@ -302,6 +293,7 @@ class DoclingTableExtractor:
             raise FileNotFoundError(f"PDF not found: {self._pdf_path}")
 
         self._expected_cols = expected_cols
+        self._strict_cols = strict_cols
         self._header_row_count_override = header_row_count
         pipeline_options = _build_pipeline_options(ocr_lang=ocr_lang)
         self._converter = DocumentConverter(
@@ -337,12 +329,9 @@ class DoclingTableExtractor:
 
         Returns:
             A list of ``(page_no, dataframe)`` tuples, one per table that
-            survived flattening/validation. ``page_no`` is 0-indexed to
-            match the rest of the pipeline (``page_indices``); it is
-            ``None`` only if Docling did not report provenance for that
-            table. Tables that fail grid validation (see
-            ``flatten_docling_dataframe``) are dropped and logged so the
-            caller's cascade can fill that specific page from PaddleOCR.
+            converted successfully. ``page_no`` is 0-indexed. Tables that
+            fail hard conversion are skipped; width mismatches only drop
+            when ``strict_cols=True``.
 
         Raises:
             DoclingExtractionError: On hard conversion failures.
@@ -357,17 +346,19 @@ class DoclingTableExtractor:
         document = self._raw_result.document
         tables = getattr(document, "tables", None) or []
         results: list[tuple[int | None, pd.DataFrame]] = []
+        strict = bool(getattr(self, "_strict_cols", False))
+        expected = getattr(self, "_expected_cols", None)
         for table in tables:
             page_no = self._table_page_no(table)
             try:
                 raw_df = self._table_to_dataframe(table)
-                flat_df = flatten_docling_dataframe(raw_df, expected_cols=self._expected_cols)
+                flat_df = flatten_docling_dataframe(
+                    raw_df, expected_cols=expected, strict_cols=strict
+                )
                 results.append((page_no, flat_df))
             except ValueError as exc:
                 logger.warning(
-                    "Skipping table on page %s with misaligned grid (%s) -- "
-                    "letting the extraction cascade fall back to PaddleOCR "
-                    "for that page.",
+                    "Skipping table on page %s (%s) -- cascade may fill from PaddleOCR.",
                     page_no + 1 if page_no is not None else "?",
                     exc,
                 )
