@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -389,6 +389,41 @@ def export_to_excel(dataframes: List[pd.DataFrame], output_path: str | Path) -> 
     return output_path
 
 
+# Sheet name pattern used to round-trip page numbers through an .xlsx file
+# for the isolated (subprocess) Paddle worker on Windows -- see
+# `isolated_backends.extract_paddle_tables_isolated_with_pages`.
+PAGE_SHEET_PREFIX = "Page"
+
+
+def export_to_excel_with_pages(
+    page_dataframes: List[Tuple[int, pd.DataFrame]], output_path: str | Path
+) -> Path:
+    """
+    Write page-tagged tables to one workbook, encoding the page number in
+    each sheet name (e.g. ``Page2_Table1``) so a subprocess-isolated caller
+    can recover per-page provenance after reading the file back.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not page_dataframes:
+        pd.DataFrame({"info": ["No tables were detected by PP-Structure in this document."]}).to_excel(
+            output_path, index=False, sheet_name="Info", engine="openpyxl"
+        )
+        logger.warning("No tables detected -- wrote placeholder workbook to %s", output_path)
+        return output_path
+
+    per_page_counter: Dict[int, int] = {}
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        for page_index, df in page_dataframes:
+            per_page_counter[page_index] = per_page_counter.get(page_index, 0) + 1
+            sheet_name = f"{PAGE_SHEET_PREFIX}{page_index + 1}_Table{per_page_counter[page_index]}"[:31]
+            df.to_excel(writer, index=False, sheet_name=sheet_name)
+
+    logger.info("Exported %d page-tagged table(s) to %s", len(page_dataframes), output_path)
+    return output_path
+
+
 # ---------------------------------------------------------------------------
 # End-to-end entrypoint
 # ---------------------------------------------------------------------------
@@ -396,14 +431,18 @@ def _extract_with_v3(
     pdf_path: Path,
     engine: Any,
     apply_ocr_cleanup: bool,
-) -> List[pd.DataFrame]:
+) -> List[Tuple[int, pd.DataFrame]]:
     """
     PPStructureV3 / TableRecognitionPipelineV2 path.
 
     Prefer page-image inputs over the whole PDF: feeding multi-page PDFs into
     the heavy layout stack has crashed (access violation) on Windows CPU builds.
+
+    Returns:
+        ``(page_index, dataframe)`` tuples, ``page_index`` 0-indexed, so
+        callers can merge results with other backends per page.
     """
-    dataframes: List[pd.DataFrame] = []
+    dataframes: List[Tuple[int, pd.DataFrame]] = []
     try:
         page_images = render_pdf_to_images(pdf_path, dpi=DEFAULT_DPI)
     except Exception as exc:
@@ -449,7 +488,7 @@ def _extract_with_v3(
                 continue
             if apply_ocr_cleanup:
                 df = clean_ocr_errors(df)
-            dataframes.append(df)
+            dataframes.append((page_index, df))
             logger.info(
                 "Page %d, table %d: extracted shape %s.",
                 page_index + 1,
@@ -464,8 +503,13 @@ def _extract_with_legacy(
     engine: Any,
     dpi: int,
     apply_ocr_cleanup: bool,
-) -> List[pd.DataFrame]:
-    """Legacy PPStructure path: render pages, then call engine(image)."""
+) -> List[Tuple[int, pd.DataFrame]]:
+    """
+    Legacy PPStructure path: render pages, then call engine(image).
+
+    Returns:
+        ``(page_index, dataframe)`` tuples, ``page_index`` 0-indexed.
+    """
     try:
         page_images = render_pdf_to_images(pdf_path, dpi=dpi)
     except FileNotFoundError:
@@ -473,7 +517,7 @@ def _extract_with_legacy(
     except Exception as exc:
         raise PaddleExtractionError(f"Failed to render '{pdf_path}' to images: {exc}") from exc
 
-    dataframes: List[pd.DataFrame] = []
+    dataframes: List[Tuple[int, pd.DataFrame]] = []
     for page_index, image in enumerate(page_images):
         layout_blocks = analyze_page(image, engine=engine)
         table_blocks = filter_table_blocks(layout_blocks)
@@ -492,8 +536,32 @@ def _extract_with_legacy(
                 continue
             if apply_ocr_cleanup:
                 df = clean_ocr_errors(df)
-            dataframes.append(df)
+            dataframes.append((page_index, df))
     return dataframes
+
+
+def extract_with_pages(
+    pdf_path: str | Path,
+    dpi: int = DEFAULT_DPI,
+    apply_ocr_cleanup: bool = True,
+) -> List[Tuple[int, pd.DataFrame]]:
+    """
+    Full pipeline, but tag every table with its 0-indexed source page.
+
+    Used by the unified pipeline's per-page fallback cascade so a Docling
+    table that failed on one page can be replaced without discarding
+    Docling's (usually better) tables on the other pages.
+    """
+    pdf_path = Path(pdf_path)
+    if not pdf_path.is_file():
+        raise FileNotFoundError(f"PDF not found: {pdf_path}")
+
+    engine = get_engine()
+    api = _engine_api()
+
+    if api in ("v3", "table_v2"):
+        return _extract_with_v3(pdf_path, engine, apply_ocr_cleanup)
+    return _extract_with_legacy(pdf_path, engine, dpi, apply_ocr_cleanup)
 
 
 def extract(
@@ -505,18 +573,8 @@ def extract(
     """
     Full pipeline: PDF -> PP-Structure -> table HTML -> DataFrame -> Excel.
     """
-    pdf_path = Path(pdf_path)
-    if not pdf_path.is_file():
-        raise FileNotFoundError(f"PDF not found: {pdf_path}")
-
-    engine = get_engine()
-    api = _engine_api()
-
-    if api in ("v3", "table_v2"):
-        dataframes = _extract_with_v3(pdf_path, engine, apply_ocr_cleanup)
-    else:
-        dataframes = _extract_with_legacy(pdf_path, engine, dpi, apply_ocr_cleanup)
-
+    page_dataframes = extract_with_pages(pdf_path, dpi=dpi, apply_ocr_cleanup=apply_ocr_cleanup)
+    dataframes = [df for _, df in page_dataframes]
     export_to_excel(dataframes, output_path)
     return dataframes
 

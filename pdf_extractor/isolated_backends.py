@@ -14,10 +14,11 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 
 import pandas as pd
 
@@ -205,3 +206,65 @@ if not dfs:
         )
     logger.info("Isolated paddle returned %d table(s).", len(frames))
     return frames
+
+
+_PAGE_SHEET_RE = re.compile(r"^Page(\d+)_Table\d+$")
+
+
+def extract_paddle_tables_isolated_with_pages(
+    pdf_path: Path, work_dir: Path
+) -> List[Tuple[int, pd.DataFrame]]:
+    """
+    Run PaddleOCR PP-Structure in a subprocess, tagging each table with its
+    0-indexed source page.
+
+    Page numbers are round-tripped through the workbook's sheet names (see
+    ``paddle_extractor.export_to_excel_with_pages``) since the isolated
+    worker's return value is otherwise just a file on disk.
+    """
+    work_dir.mkdir(parents=True, exist_ok=True)
+    out_xlsx = work_dir / ".tmp_paddle_isolated_pages.xlsx"
+    if out_xlsx.exists():
+        try:
+            out_xlsx.unlink()
+        except OSError:
+            out_xlsx = work_dir / f".tmp_paddle_isolated_pages_{os.getpid()}.xlsx"
+
+    payload = f"""
+from pathlib import Path
+from pdf_extractor.logging_config import configure_app_logging
+from pdf_extractor.paddle_extractor import extract_with_pages, export_to_excel_with_pages
+
+configure_app_logging(verbose=True)
+pdf = Path(r'''{Path(pdf_path).resolve()}''')
+out = Path(r'''{out_xlsx.resolve()}''')
+if not pdf.is_file():
+    raise SystemExit(f'PDF missing: {{pdf}}')
+page_dfs = extract_with_pages(pdf, apply_ocr_cleanup=True)
+export_to_excel_with_pages(page_dfs, out)
+print(f'PADDLE_OK tables={{len(page_dfs)}} path={{out}}')
+if not page_dfs:
+    raise SystemExit('Paddle returned 0 tables')
+"""
+    _run_worker(payload, label="paddle", timeout_s=PADDLE_TIMEOUT_S)
+    if not out_xlsx.is_file():
+        raise RuntimeError(f"Paddle worker finished but did not write {out_xlsx}")
+
+    results: List[Tuple[int, pd.DataFrame]] = []
+    xl = pd.ExcelFile(out_xlsx)
+    for sheet in xl.sheet_names:
+        match = _PAGE_SHEET_RE.match(sheet)
+        if not match:
+            continue  # e.g. the "Info" placeholder sheet for 0 tables
+        page_index = int(match.group(1)) - 1
+        df = pd.read_excel(out_xlsx, sheet_name=sheet, dtype=str).fillna("")
+        if not df.empty:
+            results.append((page_index, df))
+
+    if not results:
+        raise RuntimeError(
+            f"Paddle wrote {out_xlsx} but no usable table sheets were found "
+            f"(sheets={xl.sheet_names})."
+        )
+    logger.info("Isolated paddle returned %d page-tagged table(s).", len(results))
+    return results

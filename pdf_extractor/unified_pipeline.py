@@ -20,7 +20,7 @@ import logging
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -43,11 +43,13 @@ from .isolated_backends import (
     _skip_marker,
     extract_markdown_isolated,
     extract_paddle_tables_isolated,
+    extract_paddle_tables_isolated_with_pages,
 )
 from .marker_extractor import MarkerExtractor
 from .markdown_parser import MarkdownBlockParser
 from .paddle_extractor import PaddleExtractionError
 from .paddle_extractor import extract as paddle_extract
+from .paddle_extractor import extract_with_pages as paddle_extract_with_pages
 from .text_fallback import extract_plaintext_fallback, plaintext_as_markdown
 
 try:
@@ -65,6 +67,7 @@ BACKEND_NONE = "none"
 BACKEND_DOCLING = "docling"
 BACKEND_VLM = "vlm"  # retained for backward-compatible result labels only
 BACKEND_PADDLE = "paddle"
+BACKEND_HYBRID = "docling+paddle"  # some pages from Docling, gaps filled by Paddle
 BACKEND_GRID = "grid"
 BACKEND_MARKER = "marker"
 BACKEND_FAILED = "failed"
@@ -98,6 +101,13 @@ def _run_paddle_fallback(pdf_path: Path, out_dir: Path) -> List[pd.DataFrame]:
         return paddle_extract(pdf_path, output_path=tmp_path, apply_ocr_cleanup=True)
     finally:
         tmp_path.unlink(missing_ok=True)
+
+
+def _run_paddle_fallback_with_pages(pdf_path: Path, out_dir: Path) -> List[Tuple[int, pd.DataFrame]]:
+    """Same as `_run_paddle_fallback`, but tags each table with its 0-indexed page."""
+    if _needs_process_isolation():
+        return extract_paddle_tables_isolated_with_pages(pdf_path, out_dir)
+    return paddle_extract_with_pages(pdf_path, apply_ocr_cleanup=True)
 
 
 def _run_grid_fallback(pdf_path: Path, out_dir: Path, table_settings: dict) -> List[pd.DataFrame]:
@@ -162,6 +172,12 @@ class UnifiedPDFPipeline:
         page_indices: List[int],
     ) -> Tuple[List[pd.DataFrame], str]:
         # --- Docling TableFormer (offline, CPU/GPU; primary table backend) ---
+        # Cascade operates PER PAGE, not just per document: if Docling drops
+        # one page's table (misaligned grid) but successfully extracts
+        # another page's, we must NOT silently ship the document missing
+        # that page's data just because *some* table came back.
+        docling_by_page: Dict[int, pd.DataFrame] = {}
+        docling_unplaced: List[pd.DataFrame] = []  # tables with unknown page_no
         if not _DOCLING_AVAILABLE or DoclingTableExtractor is None:
             logger.warning(
                 "Docling is not installed -- skipping TableFormer. "
@@ -174,13 +190,12 @@ class UnifiedPDFPipeline:
                     [p + 1 for p in page_indices],
                 )
                 extractor = DoclingTableExtractor(pdf_path)
-                dataframes = extractor.extract()
-                if dataframes:
-                    logger.info("Docling extracted %d table(s).", len(dataframes))
-                    return dataframes, BACKEND_DOCLING
-                logger.warning(
-                    "Docling returned 0 tables -- falling back to PaddleOCR."
-                )
+                for page_no, df in extractor.extract_with_pages():
+                    if page_no is None:
+                        docling_unplaced.append(df)
+                    else:
+                        docling_by_page[page_no] = df
+                logger.info("Docling extracted %d table(s).", len(docling_by_page) + len(docling_unplaced))
             except (DoclingExtractionError, FileNotFoundError, OSError, RuntimeError) as exc:
                 logger.warning(
                     "Docling unavailable/failed (%s) -- falling back to PaddleOCR.",
@@ -192,13 +207,49 @@ class UnifiedPDFPipeline:
                     exc,
                 )
 
+        missing_pages = [p for p in page_indices if p not in docling_by_page]
+
+        if docling_by_page and not missing_pages:
+            logger.info("Docling covered every detected table page -- no fallback needed.")
+            ordered = [docling_by_page[p] for p in sorted(docling_by_page)] + docling_unplaced
+            return ordered, BACKEND_DOCLING
+
+        if docling_by_page and missing_pages:
+            logger.warning(
+                "Docling covered %d/%d table page(s); page(s) %s missing/misaligned "
+                "-- filling gaps with PaddleOCR instead of dropping them.",
+                len(docling_by_page),
+                len(page_indices),
+                [p + 1 for p in missing_pages],
+            )
+        else:
+            missing_pages = list(page_indices)
+            logger.warning("Docling returned 0 usable tables -- falling back to PaddleOCR.")
+
         # --- PaddleOCR PP-Structure (v3 on paddleocr>=3; works on CPU) ---
+        # Fills exactly the pages Docling could not, so a good Docling table
+        # is never thrown away just because another page needed a fallback.
         try:
             logger.info("Table backend: trying PaddleOCR PP-Structure...")
-            dataframes = _run_paddle_fallback(pdf_path, out_dir)
-            if dataframes:
-                logger.info("PaddleOCR extracted %d table(s).", len(dataframes))
-                return dataframes, BACKEND_PADDLE
+            paddle_pages = _run_paddle_fallback_with_pages(pdf_path, out_dir)
+            merged = dict(docling_by_page)
+            for page_no, df in paddle_pages:
+                if page_no in missing_pages or page_no not in merged:
+                    merged[page_no] = df
+            still_missing = [p for p in page_indices if p not in merged]
+            if merged:
+                backend = BACKEND_HYBRID if docling_by_page else BACKEND_PADDLE
+                if still_missing:
+                    logger.error(
+                        "Page(s) %s still have no valid table after Docling + "
+                        "PaddleOCR -- shipping the %d page(s) that did succeed.",
+                        [p + 1 for p in still_missing],
+                        len(merged),
+                    )
+                else:
+                    logger.info("PaddleOCR filled every remaining gap.")
+                ordered = [merged[p] for p in sorted(merged)] + docling_unplaced
+                return ordered, backend
             logger.warning("PaddleOCR found no tables -- falling back to pdfplumber grid.")
         except (PaddleExtractionError, RuntimeError, OSError) as exc:
             logger.warning(
@@ -206,6 +257,18 @@ class UnifiedPDFPipeline:
                 "Install with: pip install paddlepaddle==3.2.2 'paddleocr>=3.0' 'paddlex[ocr]'",
                 exc,
             )
+
+        if docling_by_page:
+            # Paddle itself failed entirely, but Docling still got *some*
+            # pages right -- better to ship those than nothing at all.
+            logger.warning(
+                "PaddleOCR fallback failed -- shipping the %d Docling page(s) that "
+                "did succeed; page(s) %s remain missing.",
+                len(docling_by_page),
+                [p + 1 for p in missing_pages],
+            )
+            ordered = [docling_by_page[p] for p in sorted(docling_by_page)] + docling_unplaced
+            return ordered, BACKEND_DOCLING
 
         # --- pdfplumber lines (native/vector PDFs only; scans usually get 0) ---
         logger.info("Table backend: trying pdfplumber ruled-line grid...")

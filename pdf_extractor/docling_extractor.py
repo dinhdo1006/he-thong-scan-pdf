@@ -38,6 +38,13 @@ from .ocr_cleanup import clean_ocr_errors
 logger = logging.getLogger(__name__)
 
 EXPECTED_COL_COUNT = 9  # Form B06 has 9 columns
+# Form B06-THA always has exactly 2 header rows: a group-label row (spanning
+# "Ủy thác THA" / "Trả đơn THA" / "Đình chỉ THA" / "Miễn, giảm THA" ...) and a
+# column-code row ("A B 1 2 3 4 5 6 7"). TableFormer's own `column_header`
+# classification is unreliable on low-quality scans -- it sometimes tags 5-6
+# leading rows as headers, which smears every label into a single garbled
+# column. Forcing this known value sidesteps that misclassification.
+EXPECTED_HEADER_ROWS = 2
 
 # Vietnamese language codes for the two OCR engine families Docling supports.
 # EasyOCR uses ISO 639-1 ("vi"); Tesseract uses the 3-letter ISO 639-2 code
@@ -267,6 +274,7 @@ class DoclingTableExtractor:
         *,
         ocr_lang: list[str] | None = None,
         expected_cols: int = EXPECTED_COL_COUNT,
+        header_row_count: int | None = EXPECTED_HEADER_ROWS,
     ) -> None:
         """
         Initialize the extractor for a single PDF.
@@ -279,6 +287,12 @@ class DoclingTableExtractor:
             expected_cols: Physical column count the flattened grid must
                 match; mismatches raise ``ValueError`` during ``extract()``
                 so the caller's cascade can fall back to PaddleOCR.
+            header_row_count: Fixed number of leading grid rows to treat as
+                the column header, overriding TableFormer's own (unreliable
+                on low-quality scans) ``column_header`` classification.
+                Defaults to ``EXPECTED_HEADER_ROWS`` (2, matching Form
+                B06-THA). Pass ``None`` to fall back to TableFormer's
+                auto-detected header rows instead.
 
         Raises:
             FileNotFoundError: If ``pdf_path`` does not exist.
@@ -288,6 +302,7 @@ class DoclingTableExtractor:
             raise FileNotFoundError(f"PDF not found: {self._pdf_path}")
 
         self._expected_cols = expected_cols
+        self._header_row_count_override = header_row_count
         pipeline_options = _build_pipeline_options(ocr_lang=ocr_lang)
         self._converter = DocumentConverter(
             format_options={
@@ -296,15 +311,38 @@ class DoclingTableExtractor:
         )
         self._raw_result: Any = None
 
-    def extract(self) -> list[pd.DataFrame]:
+    @staticmethod
+    def _table_page_no(table: Any) -> int | None:
         """
-        Run Docling conversion on ``self._pdf_path``.
+        Return the 0-indexed page number a Docling ``TableItem`` was found on.
+
+        Uses ``table.prov[0].page_no`` (Docling provenance is 1-indexed).
+        Returns ``None`` if unavailable so callers can degrade gracefully
+        instead of mis-mapping a table to the wrong page.
+        """
+        prov = getattr(table, "prov", None) or []
+        if not prov:
+            return None
+        page_no = getattr(prov[0], "page_no", None)
+        if page_no is None:
+            return None
+        try:
+            return int(page_no) - 1
+        except (TypeError, ValueError):
+            return None
+
+    def extract_with_pages(self) -> list[tuple[int | None, pd.DataFrame]]:
+        """
+        Run Docling conversion and return each table tagged with its page.
 
         Returns:
-            A list of pandas DataFrames, one per table found in the document.
-            Each DataFrame uses a pandas MultiIndex on columns when the table
-            has multi-level (spanning) headers. If no tables are found,
-            returns ``[]``.
+            A list of ``(page_no, dataframe)`` tuples, one per table that
+            survived flattening/validation. ``page_no`` is 0-indexed to
+            match the rest of the pipeline (``page_indices``); it is
+            ``None`` only if Docling did not report provenance for that
+            table. Tables that fail grid validation (see
+            ``flatten_docling_dataframe``) are dropped and logged so the
+            caller's cascade can fill that specific page from PaddleOCR.
 
         Raises:
             DoclingExtractionError: On hard conversion failures.
@@ -318,25 +356,58 @@ class DoclingTableExtractor:
 
         document = self._raw_result.document
         tables = getattr(document, "tables", None) or []
-        dataframes: list[pd.DataFrame] = []
+        results: list[tuple[int | None, pd.DataFrame]] = []
         for table in tables:
+            page_no = self._table_page_no(table)
             try:
                 raw_df = self._table_to_dataframe(table)
-                dataframes.append(
-                    flatten_docling_dataframe(raw_df, expected_cols=self._expected_cols)
-                )
+                flat_df = flatten_docling_dataframe(raw_df, expected_cols=self._expected_cols)
+                results.append((page_no, flat_df))
             except ValueError as exc:
                 logger.warning(
-                    "Skipping table with misaligned grid (%s) -- letting the "
-                    "extraction cascade fall back to PaddleOCR.",
+                    "Skipping table on page %s with misaligned grid (%s) -- "
+                    "letting the extraction cascade fall back to PaddleOCR "
+                    "for that page.",
+                    page_no + 1 if page_no is not None else "?",
                     exc,
                 )
             except Exception as exc:
                 logger.warning(
-                    "Skipping table that failed DataFrame conversion: %s",
+                    "Skipping table on page %s that failed DataFrame conversion: %s",
+                    page_no + 1 if page_no is not None else "?",
                     exc,
                 )
-        return dataframes
+        return results
+
+    def extract(self) -> list[pd.DataFrame]:
+        """
+        Run Docling conversion on ``self._pdf_path``.
+
+        Returns:
+            A list of pandas DataFrames, one per table found in the document.
+            If no tables are found, returns ``[]``. See
+            ``extract_with_pages()`` for per-page provenance.
+
+        Raises:
+            DoclingExtractionError: On hard conversion failures.
+        """
+        return [df for _, df in self.extract_with_pages()]
+
+    def _resolve_header_row_count(self, grid: list[list[Any]]) -> int:
+        """
+        Decide how many leading grid rows are the column header.
+
+        Uses ``self._header_row_count_override`` when set (clamped so at
+        least one data row always remains), otherwise falls back to
+        TableFormer's own ``column_header`` classification.
+        """
+        # getattr guards against extractors built via `__new__` in tests,
+        # which bypass `__init__` and never set this attribute.
+        override = getattr(self, "_header_row_count_override", None)
+        if override is None:
+            return self._count_header_rows(grid)
+        n_rows = len(grid)
+        return max(0, min(int(override), max(n_rows - 1, 0)))
 
     def _count_header_rows(self, grid: list[list[Any]]) -> int:
         """Count leading rows where all non-empty cells are column headers."""
@@ -407,7 +478,7 @@ class DoclingTableExtractor:
         if n_cols <= 0:
             return pd.DataFrame()
 
-        header_row_count = self._count_header_rows(grid)
+        header_row_count = self._resolve_header_row_count(grid)
         n_rows = len(grid)
 
         if header_row_count > 0:
