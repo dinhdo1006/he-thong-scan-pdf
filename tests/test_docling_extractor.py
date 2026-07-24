@@ -338,3 +338,62 @@ def test_select_ocr_options_uses_easyocr_when_available() -> None:
         result = _select_ocr_options(["vi"])
     assert result is not None
     assert list(result.lang) == ["vi"]
+
+
+def test_select_ocr_options_falls_back_to_tesseract_when_easyocr_raises() -> None:
+    import sys
+    import types
+
+    from pdf_extractor.docling_extractor import TesseractCliOcrOptions
+
+    fake_tess = types.ModuleType("pytesseract")
+    # Force EasyOCR path to raise, then allow pytesseract import.
+    with patch(
+        "pdf_extractor.docling_extractor.EasyOcrOptions",
+        side_effect=RuntimeError("easyocr model load failed"),
+    ):
+        with patch.dict(
+            sys.modules,
+            {
+                "easyocr": types.ModuleType("easyocr"),
+                "tesserocr": None,
+                "pytesseract": fake_tess,
+            },
+        ):
+            # Import of easyocr succeeds; EasyOcrOptions construction fails → Tesseract.
+            result = _select_ocr_options(["vi"])
+    assert result is not None
+    assert isinstance(result, TesseractCliOcrOptions)
+    assert list(result.lang) == ["vie"]
+
+
+def test_build_pipeline_options_default_enables_ocr_with_easyocr() -> None:
+    import sys
+    import types
+
+    from pdf_extractor.docling_extractor import _build_pipeline_options
+
+    fake_easyocr = types.ModuleType("easyocr")
+    with patch.dict(sys.modules, {"easyocr": fake_easyocr}):
+        opts = _build_pipeline_options(pdf_path="scan.pdf")
+    assert opts.do_ocr is True
+    assert opts.ocr_options is not None
+    assert list(opts.ocr_options.lang) == ["vi"]
+
+
+def test_build_pipeline_options_disable_ocr_flag() -> None:
+    from pdf_extractor.docling_extractor import _build_pipeline_options
+
+    opts = _build_pipeline_options(disable_ocr=True, pdf_path="scan.pdf")
+    assert opts.do_ocr is False
+
+
+def test_build_pipeline_options_warns_when_no_ocr_engine(capsys) -> None:
+    from pdf_extractor.docling_extractor import _build_pipeline_options
+
+    with patch("pdf_extractor.docling_extractor._select_ocr_options", return_value=None):
+        opts = _build_pipeline_options(pdf_path="form_b06.pdf")
+    assert opts.do_ocr is False
+    captured = capsys.readouterr()
+    assert "[WARN] Docling running without OCR anchor — column collapse risk high" in captured.out
+    assert "form_b06.pdf" in captured.out

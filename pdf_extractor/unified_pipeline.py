@@ -134,11 +134,13 @@ class UnifiedPDFPipeline:
         *,
         skip_marker: Optional[bool] = None,
         force_marker: bool = False,
+        docling_no_ocr: bool = False,
     ) -> None:
         self.marker = marker_extractor or MarkerExtractor()
         self.table_settings = table_settings
         self.skip_marker = skip_marker
         self.force_marker = force_marker
+        self.docling_no_ocr = bool(docling_no_ocr)
 
     def _detect_table_pages(self, pdf_path: Path) -> List[int]:
         return detect_table_pages(pdf_path, table_settings=self.table_settings)
@@ -190,7 +192,10 @@ class UnifiedPDFPipeline:
                     "Table backend: trying Docling TableFormer on page(s) %s...",
                     [p + 1 for p in page_indices],
                 )
-                extractor = DoclingTableExtractor(pdf_path)
+                extractor = DoclingTableExtractor(
+                    pdf_path,
+                    disable_ocr=self.docling_no_ocr,
+                )
                 for page_no, df in extractor.extract_with_pages():
                     if page_no is None:
                         docling_unplaced.append(df)
@@ -357,6 +362,7 @@ class UnifiedPDFPipeline:
         skip_tables: bool = False,
         skip_marker: Optional[bool] = None,
         force_marker: bool = False,
+        docling_no_ocr: Optional[bool] = None,
         write_txt: bool = True,
         write_xlsx: bool = True,
         write_docx: bool = False,
@@ -371,6 +377,8 @@ class UnifiedPDFPipeline:
             self.skip_marker = skip_marker
         if force_marker:
             self.force_marker = True
+        if docling_no_ocr is not None:
+            self.docling_no_ocr = bool(docling_no_ocr)
         pdf_path = Path(pdf_path)
         if not pdf_path.is_file():
             raise FileNotFoundError(f"PDF not found: {pdf_path}")
@@ -516,6 +524,11 @@ def _build_arg_parser():
         action="store_true",
         help="Fast test: Marker only, skip Docling/Paddle/grid extraction.",
     )
+    parser.add_argument(
+        "--docling-no-ocr",
+        action="store_true",
+        help="Force Docling do_ocr=False (debug column-collapse without OCR anchors).",
+    )
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging.")
     return parser
 
@@ -527,8 +540,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     configure_app_logging(verbose=args.verbose)
 
     try:
-        result = UnifiedPDFPipeline().run(
-            args.input, output=args.output, skip_tables=args.skip_tables, write_docx=args.docx
+        result = UnifiedPDFPipeline(docling_no_ocr=args.docling_no_ocr).run(
+            args.input,
+            output=args.output,
+            skip_tables=args.skip_tables,
+            write_docx=args.docx,
+            docling_no_ocr=args.docling_no_ocr,
         )
     except Exception as exc:
         logging.error("Pipeline failed: %s", exc)

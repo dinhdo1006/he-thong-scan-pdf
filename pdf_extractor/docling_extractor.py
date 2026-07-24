@@ -60,77 +60,107 @@ def _select_ocr_options(easyocr_lang: list[str] | None = None) -> OcrOptions | N
     """
     Pick the best available OCR engine for scanned Vietnamese PDFs.
 
-    TableFormer only *guesses* column geometry when it has no text anchors
-    to lock onto (``do_ocr=False``) -- this is the root cause of "Column
-    Collapse" on scanned B06-THA forms. Enabling native OCR with an explicit
-    Vietnamese language code gives TableFormer real text anchors and
-    preserves diacritics (dấu thanh) that a language-agnostic OCR pass
-    would otherwise strip.
-
-    Tries EasyOCR first (bundles its own language models, no external
-    binary required), then falls back to Tesseract (tesserocr, then the
-    CLI wrapper) if EasyOCR is not installed.
+    Default path always prefers EasyOCR ``lang=["vi"]``. If EasyOCR cannot
+    be imported or configured (missing package / model load error), fall
+    back to Tesseract ``lang=["vie"]``. Returns ``None`` only when both
+    families fail -- caller must then set ``do_ocr=False`` and warn loudly.
 
     Returns:
         A configured ``OcrOptions`` instance, or ``None`` if no OCR engine
-        is available (caller should then disable OCR and log loudly).
+        is available.
     """
     easyocr_lang = easyocr_lang or DEFAULT_EASYOCR_LANG
 
+    # 1) EasyOCR first (bundled language models, no external binary).
     try:
         import easyocr  # noqa: F401
 
+        options = EasyOcrOptions(lang=easyocr_lang, force_full_page_ocr=False)
         logger.info("OCR engine: EasyOCR (lang=%s).", easyocr_lang)
-        return EasyOcrOptions(lang=easyocr_lang, force_full_page_ocr=False)
-    except ImportError:
-        logger.info("easyocr not installed -- trying Tesseract for Vietnamese OCR.")
+        return options
+    except Exception as exc:
+        logger.info(
+            "EasyOCR unavailable (%s) -- trying Tesseract for Vietnamese OCR.",
+            exc,
+        )
 
+    # 2) Tesseract fallback (tesserocr, then CLI wrapper).
     try:
         import tesserocr  # noqa: F401
 
+        options = TesseractOcrOptions(lang=DEFAULT_TESSERACT_LANG)
         logger.info("OCR engine: Tesseract (tesserocr, lang=%s).", DEFAULT_TESSERACT_LANG)
-        return TesseractOcrOptions(lang=DEFAULT_TESSERACT_LANG)
-    except ImportError:
-        pass
+        return options
+    except Exception as exc:
+        logger.debug("tesserocr unavailable (%s).", exc)
 
     try:
         import pytesseract  # noqa: F401
 
+        options = TesseractCliOcrOptions(lang=DEFAULT_TESSERACT_LANG)
         logger.info("OCR engine: Tesseract (CLI, lang=%s).", DEFAULT_TESSERACT_LANG)
-        return TesseractCliOcrOptions(lang=DEFAULT_TESSERACT_LANG)
-    except ImportError:
-        pass
+        return options
+    except Exception as exc:
+        logger.debug("pytesseract unavailable (%s).", exc)
 
     logger.error(
-        "No OCR engine found (tried easyocr, tesserocr, pytesseract). Docling "
-        "will fall back to do_ocr=False -- diacritics on scanned PDFs WILL be "
-        "lost and TableFormer will guess column geometry blindly. Install one "
-        "with: pip install easyocr  (or Tesseract-OCR + the 'vie' language pack)."
+        "No OCR engine found (tried EasyOCR lang=%s, Tesseract lang=%s). "
+        "Install with: pip install easyocr  (or Tesseract-OCR + the 'vie' language pack).",
+        easyocr_lang,
+        DEFAULT_TESSERACT_LANG,
     )
     return None
 
 
-def _build_pipeline_options(*, ocr_lang: list[str] | None = None) -> PdfPipelineOptions:
+def _warn_docling_without_ocr(pdf_path: str | pathlib.Path | None) -> None:
+    """Emit the required console warning when Docling runs without OCR anchors."""
+    pdf_label = str(pdf_path) if pdf_path is not None else "(unknown PDF)"
+    message = (
+        "[WARN] Docling running without OCR anchor — column collapse "
+        f"risk high | pdf={pdf_label}"
+    )
+    # logger.warning reaches console via configure_app_logging; print keeps
+    # the exact token visible even if a caller muted the package logger.
+    logger.warning(message)
+    print(message, flush=True)
+
+
+def _build_pipeline_options(
+    *,
+    ocr_lang: list[str] | None = None,
+    disable_ocr: bool = False,
+    pdf_path: str | pathlib.Path | None = None,
+) -> PdfPipelineOptions:
     """
     Build PdfPipelineOptions with native OCR + Vietnamese text anchors enabled.
 
     ``do_table_structure=True`` keeps TableFormer in ACCURATE mode.
-    ``do_ocr=True`` (with a Vietnamese-aware engine) gives TableFormer real
-    text anchors instead of blind geometry guesses, which is the root cause
-    of "Column Collapse" on scanned B06-THA forms.
+    By default ``do_ocr=True`` (EasyOCR ``vi``, else Tesseract ``vie``).
+    ``disable_ocr=True`` forces ``do_ocr=False`` for debug (``--docling-no-ocr``).
+    Only when both OCR engines fail (and OCR is not explicitly disabled) do
+    we allow ``do_ocr=False``, with a loud column-collapse warning.
     """
     options = PdfPipelineOptions()
     options.do_table_structure = True
     options.table_structure_options.mode = TableFormerMode.ACCURATE
+
+    if disable_ocr:
+        options.do_ocr = False
+        logger.info(
+            "Docling OCR disabled by flag (--docling-no-ocr / disable_ocr=True) for %s.",
+            pdf_path or "(unknown PDF)",
+        )
+        return options
 
     ocr_options = _select_ocr_options(ocr_lang)
     if ocr_options is not None:
         options.do_ocr = True
         options.ocr_options = ocr_options
     else:
-        # Degrade gracefully instead of crashing the whole pipeline when no
-        # OCR engine is installed -- Tier 2/3 fallbacks still apply.
+        # Last resort only -- Tier 2/3 fallbacks still apply, but column
+        # collapse risk is high on scanned forms without text anchors.
         options.do_ocr = False
+        _warn_docling_without_ocr(pdf_path)
     return options
 
 
@@ -267,6 +297,7 @@ class DoclingTableExtractor:
         expected_cols: int | None = None,
         header_row_count: int | None = None,
         strict_cols: bool = False,
+        disable_ocr: bool = False,
     ) -> None:
         """
         Initialize the extractor for a single PDF.
@@ -284,6 +315,9 @@ class DoclingTableExtractor:
                 a known template needs an override.
             strict_cols: When True with ``expected_cols``, drop tables whose
                 flattened width mismatches (legacy form-locked behavior).
+            disable_ocr: When True, force ``do_ocr=False`` (CLI
+                ``--docling-no-ocr``) for debug comparisons without OCR
+                anchors. Default False — always try EasyOCR then Tesseract.
 
         Raises:
             FileNotFoundError: If ``pdf_path`` does not exist.
@@ -295,7 +329,12 @@ class DoclingTableExtractor:
         self._expected_cols = expected_cols
         self._strict_cols = strict_cols
         self._header_row_count_override = header_row_count
-        pipeline_options = _build_pipeline_options(ocr_lang=ocr_lang)
+        self._disable_ocr = bool(disable_ocr)
+        pipeline_options = _build_pipeline_options(
+            ocr_lang=ocr_lang,
+            disable_ocr=self._disable_ocr,
+            pdf_path=self._pdf_path,
+        )
         self._converter = DocumentConverter(
             format_options={
                 InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),

@@ -50,6 +50,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Force-load Marker/Surya (slow; needs working torch). Overrides --skip-marker.",
     )
+    parser.add_argument(
+        "--docling-no-ocr",
+        action="store_true",
+        default=False,
+        help="Force Docling do_ocr=False (debug without OCR text anchors). Default: OCR on.",
+    )
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging.")
     return parser
 
@@ -71,12 +77,14 @@ def main(argv: list[str] | None = None) -> int:
         result = UnifiedPDFPipeline(
             skip_marker=skip_marker,
             force_marker=args.force_marker,
+            docling_no_ocr=args.docling_no_ocr,
         ).run(
             pdf_path,
             output=args.output,
             skip_tables=args.skip_tables,
             skip_marker=skip_marker,
             force_marker=args.force_marker,
+            docling_no_ocr=args.docling_no_ocr,
             write_docx=args.docx,
         )
     except Exception as exc:
