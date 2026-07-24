@@ -20,6 +20,12 @@ logger = logging.getLogger(__name__)
 # PaddleOCR should be run for a quality comparison (generic, not form-locked).
 LOW_QUALITY_THRESHOLD = 0.42
 
+# When two backends disagree on width by this many columns or more, prefer
+# the wider grid so multi-page stitch can keep column alignment. A near-zero
+# wider table (total collapse) can still lose to a cleaner narrower one.
+WIDTH_PREFER_GAP = 2
+WIDTH_MIN_SCORE = 0.25
+
 _GARBAGE_HEADER_RE = re.compile(r"\|_|_{2,}|\|{2,}")
 _WEIRD_SHORT_RE = re.compile(r"^[^\w\dÀ-ỹ]+$", re.IGNORECASE)
 
@@ -83,11 +89,18 @@ def pick_better_table(
     right: pd.DataFrame | None,
 ) -> tuple[pd.DataFrame, str]:
     """
-    Choose the higher-scoring table between two backends.
+    Choose the better table between two backends for the same page.
+
+    Rules (form-agnostic):
+    1. Only one side present -> that side wins.
+    2. If widths differ by ``WIDTH_PREFER_GAP`` or more, prefer the **wider**
+       grid when it is not near-collapsed (score >= ``WIDTH_MIN_SCORE``).
+       This prevents a clean 3-column fragment from beating a usable 9-column
+       table and breaking later stitch/merge.
+    3. Otherwise pick the higher ``score_table_quality``.
 
     Returns:
         ``(dataframe, winner)`` where winner is ``"left"`` or ``"right"``.
-        If only one side exists, that side wins. If neither exists, raises.
     """
     if left is None and right is None:
         raise ValueError("pick_better_table() needs at least one DataFrame")
@@ -95,8 +108,18 @@ def pick_better_table(
         return right, "right"  # type: ignore[return-value]
     if right is None:
         return left, "left"
+
+    left_cols = len(left.columns)
+    right_cols = len(right.columns)
     left_score = score_table_quality(left)
     right_score = score_table_quality(right)
+    gap = left_cols - right_cols
+
+    if gap >= WIDTH_PREFER_GAP and left_score >= WIDTH_MIN_SCORE:
+        return left, "left"
+    if -gap >= WIDTH_PREFER_GAP and right_score >= WIDTH_MIN_SCORE:
+        return right, "right"
+
     if right_score > left_score:
         return right, "right"
     return left, "left"

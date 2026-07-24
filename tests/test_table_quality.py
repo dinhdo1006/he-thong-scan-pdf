@@ -33,6 +33,35 @@ def test_pick_better_table_prefers_cleaner() -> None:
     assert chosen.equals(clean)
 
 
+def test_pick_better_table_prefers_wider_over_narrow_high_score() -> None:
+    """A clean 3-col fragment must not beat a usable 9-col table (stitch)."""
+    narrow = pd.DataFrame(
+        [["1.3.2", "Thu tai san", "x"]],
+        columns=["STT", "Mo_ta", "col3"],
+    )
+    wide = pd.DataFrame(
+        [["1.3.2", "Thu tai san", "", "", "", "", "", "", ""]],
+        columns=[f"c{i}" for i in range(9)],
+    )
+    # Narrow often scores higher on fill-rate; width rule must still pick wide.
+    assert score_table_quality(narrow) > score_table_quality(wide)
+    chosen, winner = pick_better_table(narrow, wide)
+    assert winner == "right"
+    assert len(chosen.columns) == 9
+
+
+def test_pick_better_table_allows_narrow_if_wide_collapsed() -> None:
+    wide_garbage = pd.DataFrame(
+        [[""] * 9],
+        columns=["a|_b|_c " + ("z" * 80)] + [f"c{i}" for i in range(8)],
+    )
+    narrow_clean = pd.DataFrame([["1", "ok"]], columns=["A", "B"])
+    # Wide score near-zero -> width preference does not apply; score picks clean.
+    chosen, winner = pick_better_table(wide_garbage, narrow_clean)
+    assert winner == "right"
+    assert chosen.equals(narrow_clean)
+
+
 def test_assign_tokens_to_cells_by_containment() -> None:
     cells = [
         TableCellBox(0, 0, BBox(0, 0, 10, 10)),

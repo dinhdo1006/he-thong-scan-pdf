@@ -95,6 +95,37 @@ def test_extract_tables_prefers_higher_quality_on_same_page(tmp_path) -> None:
     assert dfs == [clean]
 
 
+def test_extract_tables_prefers_wider_paddle_over_narrow_docling(tmp_path) -> None:
+    """Page 2: Docling 3-col must lose to Paddle 9-col so stitch can work."""
+    page0 = pd.DataFrame(
+        [["1", "mo ta"] + [""] * 7],
+        columns=[f"c{i}" for i in range(9)],
+    )
+    narrow_docling = pd.DataFrame(
+        [["1.3.2", "Thu tai san", "x"]],
+        columns=["STT", "Mo_ta", "x"],
+    )
+    wide_paddle = pd.DataFrame(
+        [["1.3.2", "Thu tai san"] + [""] * 7],
+        columns=[f"c{i}" for i in range(9)],
+    )
+    mock_extractor = MagicMock()
+    mock_extractor.extract_with_pages.return_value = [(0, page0), (1, narrow_docling)]
+
+    with patch("pdf_extractor.unified_pipeline._DOCLING_AVAILABLE", True), patch(
+        "pdf_extractor.unified_pipeline.DoclingTableExtractor", return_value=mock_extractor
+    ), patch(
+        "pdf_extractor.unified_pipeline._run_paddle_fallback_with_pages",
+        return_value=[(0, page0), (1, wide_paddle)],
+    ):
+        dfs, backend = _pipeline()._extract_tables(Path("f.pdf"), tmp_path, [0, 1])
+
+    assert backend == BACKEND_HYBRID
+    assert len(dfs[0].columns) == 9
+    assert len(dfs[1].columns) == 9
+    assert dfs[1].equals(wide_paddle)
+
+
 def test_extract_tables_keeps_clean_docling_over_weaker_paddle(tmp_path) -> None:
     """When Paddle runs for another reason, cleaner Docling still wins that page."""
     clean_docling = _clean_df("docling")

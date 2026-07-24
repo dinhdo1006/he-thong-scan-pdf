@@ -217,6 +217,23 @@ class UnifiedPDFPipeline:
             for p, df in docling_by_page.items()
             if score_table_quality(df) < LOW_QUALITY_THRESHOLD
         ]
+        # Same document, wildly different widths usually means one page collapsed
+        # (e.g. 9-col + 3-col) -- challenge with Paddle so stitch can align later.
+        docling_widths = [len(df.columns) for df in docling_by_page.values()]
+        width_inconsistent = (
+            bool(docling_widths)
+            and (max(docling_widths) - min(docling_widths)) >= 2
+        )
+        if width_inconsistent:
+            max_w = max(docling_widths)
+            for p, df in docling_by_page.items():
+                if len(df.columns) <= max_w - 2 and p not in weak_pages:
+                    weak_pages.append(p)
+            logger.warning(
+                "Docling page widths inconsistent %s -- treating narrower page(s) "
+                "as weak for Paddle comparison.",
+                {p + 1: len(df.columns) for p, df in docling_by_page.items()},
+            )
         need_paddle = bool(missing_pages or weak_pages or not docling_by_page)
 
         if docling_by_page and not need_paddle:
