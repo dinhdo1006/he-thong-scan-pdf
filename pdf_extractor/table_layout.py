@@ -37,8 +37,24 @@ def _clean(value: object) -> str:
 
 
 def is_outline_code(text: object) -> bool:
-    s = _clean(text)
+    s = normalize_outline_token(text)
     return bool(s) and bool(_OUTLINE_CODE_RE.fullmatch(s))
+
+
+def normalize_outline_token(text: object) -> str:
+    """
+    Normalize OCR-mangled outline codes before matching.
+
+    Examples: ``1⁄2`` / ``1/2`` -> ``1.2`` (only when both sides are digits).
+    """
+    s = _clean(text)
+    if not s:
+        return ""
+    # Unicode fraction slash / ASCII slash between digit groups -> dots.
+    s = s.replace("⁄", ".").replace("∕", ".")
+    if re.fullmatch(r"\d+(?:[./]\d+)+", s):
+        s = s.replace("/", ".")
+    return s
 
 
 def is_money_like(text: object) -> bool:
@@ -273,7 +289,7 @@ def realign_shifted_outline_rows(df: pd.DataFrame) -> pd.DataFrame:
         # Case 1: money in col0, outline in col1
         if is_money_like(c0) and is_outline_code(c1):
             money = c0
-            outline = c1
+            outline = normalize_outline_token(c1)
             rest = cells[2:]
             rebuilt = [outline] + rest
             while len(rebuilt) < width:
@@ -306,11 +322,59 @@ def realign_shifted_outline_rows(df: pd.DataFrame) -> pd.DataFrame:
             fixed += 1
             continue
 
+        # Case 3: outline in col0, money leaked into description (col1),
+        # real label sits in col2 — push money into first amount slot.
+        if (
+            is_outline_code(c0)
+            and is_money_like(c1)
+            and width >= 3
+            and cells[2].strip()
+            and not is_outline_code(cells[2])
+            and not is_money_like(cells[2])
+        ):
+            money = c1
+            label = cells[2].strip()
+            rest = cells[3:]
+            rebuilt = [normalize_outline_token(c0), label] + rest
+            while len(rebuilt) < width:
+                rebuilt.append("")
+            rebuilt = rebuilt[:width]
+            placed = False
+            for i in range(2, width):
+                if not rebuilt[i].strip():
+                    rebuilt[i] = money
+                    placed = True
+                    break
+            if not placed:
+                rebuilt[width - 1] = money
+            new_body.append(rebuilt)
+            fixed += 1
+            continue
+
+        # Normalize outline token in col0 when already well-placed.
+        if is_outline_code(c0):
+            norm = normalize_outline_token(c0)
+            if norm != c0:
+                cells = [norm] + cells[1:]
+                fixed += 1
+
         new_body.append(cells)
 
     if fixed:
         logger.info("Realigned %d shifted outline row(s).", fixed)
     return _df_from_matrix(cols, new_body)
+
+
+def drop_empty_spacer_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop body rows where every cell is blank (common OCR phantom lines)."""
+    if df is None or df.empty:
+        return df
+    cols, body = _matrix_from_df(df)
+    kept = [row for row in body if any(c.strip() for c in row)]
+    dropped = len(body) - len(kept)
+    if dropped:
+        logger.info("Dropped %d empty spacer row(s).", dropped)
+    return _df_from_matrix(cols, kept)
 
 
 def repair_form_table(df: pd.DataFrame) -> pd.DataFrame:
@@ -323,6 +387,7 @@ def repair_form_table(df: pd.DataFrame) -> pd.DataFrame:
     out = absorb_leading_header_rows(out)
     out = left_compact_sparse_headers(out)
     out = realign_shifted_outline_rows(out)
+    out = drop_empty_spacer_rows(out)
     return out
 
 

@@ -72,7 +72,9 @@ def parse_stt_path(stt: object) -> Optional[OutlinePath]:
     """
     if stt is None or (isinstance(stt, float) and pd.isna(stt)):
         return None
-    text = str(stt).replace("\n", " ").strip()
+    from .table_layout import normalize_outline_token
+
+    text = normalize_outline_token(stt)
     if not text:
         return None
     if _ROMAN_RE.fullmatch(text):
@@ -82,6 +84,14 @@ def parse_stt_path(stt: object) -> Optional[OutlinePath]:
         parts = tuple(int(p) for p in text.split("."))
         return ("arabic", *parts)
     return None
+
+
+def outline_level(stt: object) -> int:
+    """Hierarchy depth: ``I``/``1`` -> 1, ``1.1`` -> 2, ``1.1.2`` -> 3; else 0."""
+    path = parse_stt_path(stt)
+    if path is None:
+        return 0
+    return len(_numeric_levels(path))
 
 
 def format_stt_path(path: OutlinePath) -> str:
@@ -473,52 +483,188 @@ def evaluate_table_semantics(
     }
 
 
+def _expected_gap_codes(prev_stt: str, curr_stt: str) -> list[str]:
+    """
+    Missing outline codes strictly between prev and curr (same branch).
+
+    Only fills simple sibling gaps (1.1.5 -> 1.1.6 before 1.1.7) or the first
+    child when jumping into a deeper level (1.1 -> 1.1.1 before 1.1.2).
+    """
+    prev = parse_stt_path(prev_stt)
+    curr = parse_stt_path(curr_stt)
+    if prev is None or curr is None or prev[0] != curr[0]:
+        return []
+    kind = prev[0]
+    p = _numeric_levels(prev)
+    c = _numeric_levels(curr)
+    gaps: list[str] = []
+
+    # Jump into a deeper level: expect first child under prev.
+    if len(c) == len(p) + 1 and c[:-1] == p and c[-1] > 1:
+        for i in range(1, c[-1]):
+            gaps.append(format_stt_path((kind, *p, i)))
+        return gaps
+
+    # Same depth siblings: fill missing middle siblings.
+    if len(c) == len(p) and c[:-1] == p[:-1] and c[-1] > p[-1] + 1:
+        for i in range(p[-1] + 1, c[-1]):
+            gaps.append(format_stt_path((kind, *c[:-1], i)))
+        return gaps
+
+    return gaps
+
+
+def insert_missing_outline_placeholders(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Insert blank rows for obvious missing STT codes so hierarchy stays readable.
+
+    Placeholder rows get ``STT_gap=MISSING`` after semantic annotate.
+    """
+    if df is None or df.empty:
+        return df
+    stt_col = detect_stt_column(df)
+    if stt_col is None:
+        return df
+
+    from .table_layout import normalize_outline_token
+
+    records = df.to_dict("records")
+    out_rows: list[dict] = []
+    prev_stt = ""
+    inserted = 0
+    for rec in records:
+        raw = rec.get(stt_col, "")
+        stt = normalize_outline_token(raw)
+        if stt and stt != str(raw).strip():
+            rec = dict(rec)
+            rec[stt_col] = stt
+        if prev_stt and stt:
+            for gap in _expected_gap_codes(prev_stt, stt):
+                placeholder = {c: "" for c in df.columns}
+                placeholder[stt_col] = gap
+                placeholder["_stt_gap"] = "MISSING"
+                out_rows.append(placeholder)
+                inserted += 1
+        out_rows.append(rec)
+        if stt:
+            prev_stt = stt
+
+    if not inserted:
+        # Still return normalized STT copy when tokens changed.
+        changed = any(
+            normalize_outline_token(r.get(stt_col, ""))
+            and normalize_outline_token(r.get(stt_col, "")) != str(r.get(stt_col, "")).strip()
+            for r in records
+        )
+        if not changed:
+            return df
+        return pd.DataFrame(out_rows)
+
+    logger.info("Inserted %d missing STT placeholder row(s).", inserted)
+    return pd.DataFrame(out_rows)
+
+
+def _description_column(df: pd.DataFrame, stt_column: str) -> Optional[str]:
+    """Prefer the column immediately after STT as the criterion / label column."""
+    cols = [str(c) for c in df.columns]
+    if stt_column not in cols:
+        return None
+    idx = cols.index(stt_column)
+    if idx + 1 < len(cols):
+        return cols[idx + 1]
+    return None
+
+
 def annotate_dataframe_semantics(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Run outline + sum validators and append ``STT_valid`` / ``Sum_check`` columns.
+    Run outline + sum validators and append semantic helper columns.
 
-    Existing columns are preserved. Invalid rows emit a WARNING log / console line.
+    Wave 3 extras:
+      - normalize OCR STT tokens (``1⁄2`` -> ``1.2``)
+      - insert missing outline placeholders
+      - ``Cấp`` = hierarchy depth
+      - indent description text by depth (visual parent/child)
+      - ``STT_gap`` = MISSING for placeholder rows
+      - ``STT_valid`` / ``Sum_check`` as before
     """
     if df is None or len(getattr(df, "columns", [])) == 0:
         return df
 
-    out = df.copy()
-    report = evaluate_table_semantics(out, emit_warnings=True)
-    if not report["rows"]:
-        stt_col = detect_stt_column(out)
-        if stt_col is None:
-            out["STT_valid"] = True
-            out["Sum_check"] = "N/A"
-            return out
+    from .table_layout import normalize_outline_token
 
+    out = insert_missing_outline_placeholders(df.copy())
+    stt_col = detect_stt_column(out)
+    if stt_col is None:
+        out["Cấp"] = 0
+        out["STT_valid"] = True
+        out["Sum_check"] = "N/A"
+        out["STT_gap"] = ""
+        return out
+
+    out[stt_col] = [
+        normalize_outline_token(v) if normalize_outline_token(v) else v for v in out[stt_col]
+    ]
+
+    if "_stt_gap" in out.columns:
+        gap_flags = [str(v or "") for v in out["_stt_gap"].tolist()]
+        out = out.drop(columns=["_stt_gap"])
+    else:
+        gap_flags = [""] * len(out)
+
+    levels = [outline_level(v) for v in out[stt_col].tolist()]
+    if "Cấp" in out.columns:
+        out["Cấp"] = levels
+    else:
+        out.insert(0, "Cấp", levels)
+
+    desc_col = _description_column(out, stt_col)
+    if desc_col is not None and desc_col in out.columns:
+        indented: list[str] = []
+        for depth, val in zip(levels, out[desc_col].tolist()):
+            text = "" if val is None or (isinstance(val, float) and pd.isna(val)) else str(val)
+            text = text.strip()
+            text = re.sub(r"^(?: {2})+", "", text)
+            if depth > 1 and text:
+                text = ("  " * (depth - 1)) + text
+            indented.append(text)
+        out[desc_col] = indented
+
+    report = evaluate_table_semantics(out, emit_warnings=True)
     stt_valid_flags: list[bool] = []
     sum_checks: list[str] = []
-    for row in report["rows"]:
-        stt = str(row.get("stt", "") or "").strip()
-        stt_ok = bool(row.get("stt_valid", True))
-        stt_valid_flags.append(stt_ok)
-        if not stt_ok:
-            issue = row.get("stt_issue") or "outline invalid"
-            print(f"[WARN] STT_valid=False | stt={stt} | {issue}", flush=True)
-
-        sum_ok = bool(row.get("sum_valid", True))
-        sum_diff = row.get("sum_diff")
-        if sum_diff is None:
-            sum_checks.append("N/A")
-        elif sum_ok:
-            sum_checks.append("OK")
-        else:
-            label = f"FAIL:Δ={sum_diff:g}"
-            sum_checks.append(label)
-            issue = row.get("sum_issue") or label
-            print(f"[WARN] Sum_check=FAIL | stt={stt} | {issue}", flush=True)
-
     if report["rows"]:
+        for row in report["rows"]:
+            stt = str(row.get("stt", "") or "").strip()
+            stt_ok = bool(row.get("stt_valid", True))
+            stt_valid_flags.append(stt_ok)
+            if not stt_ok:
+                issue = row.get("stt_issue") or "outline invalid"
+                print(f"[WARN] STT_valid=False | stt={stt} | {issue}", flush=True)
+
+            sum_ok = bool(row.get("sum_valid", True))
+            sum_diff = row.get("sum_diff")
+            if sum_diff is None:
+                sum_checks.append("N/A")
+            elif sum_ok:
+                sum_checks.append("OK")
+            else:
+                label = f"FAIL:Δ={sum_diff:g}"
+                sum_checks.append(label)
+                issue = row.get("sum_issue") or label
+                print(f"[WARN] Sum_check=FAIL | stt={stt} | {issue}", flush=True)
         out["STT_valid"] = stt_valid_flags
         out["Sum_check"] = sum_checks
     else:
         out["STT_valid"] = True
         out["Sum_check"] = "N/A"
+
+    padded_gaps = gap_flags[: len(out)] + [""] * max(0, len(out) - len(gap_flags))
+    out["STT_gap"] = padded_gaps
+    for i, flag in enumerate(padded_gaps):
+        if flag == "MISSING":
+            stt = str(out.iloc[i][stt_col] or "").strip()
+            logger.warning("[WARN] STT_gap=MISSING | stt=%s | placeholder inserted", stt)
+            print(f"[WARN] STT_gap=MISSING | stt={stt} | placeholder inserted", flush=True)
     return out
 
 
