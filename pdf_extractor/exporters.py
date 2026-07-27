@@ -620,8 +620,12 @@ def _merge_outline_continuation_blocks(parts: list[AssembledBlock]) -> list[Asse
     """
     Merge consecutive assembled table blocks that continue the same outline
     form across a page break (e.g. page1 ends at 1.3.1, page2 starts at 1.3.2).
-    Prose between tables blocks stitching for that pair.
+
+    Also force-merges B06/CD_02 tables even when short prose sits between them
+    (common with page-region assemble: footer of page 1 / header of page 2).
     """
+    from .table_layout import looks_like_b06_cd02_table, merge_b06_cd02_tables
+
     out: list[AssembledBlock] = []
     i = 0
     while i < len(parts):
@@ -640,7 +644,39 @@ def _merge_outline_continuation_blocks(parts: list[AssembledBlock]) -> list[Asse
 
         for df in stitch_outline_continuation_tables(run):
             out.append(AssembledBlock(kind="table", content=df))
-    return out
+
+    # Second pass: B06 tables separated by prose → one table, prose kept after.
+    table_idxs = [
+        idx
+        for idx, b in enumerate(out)
+        if b.kind == "table" and isinstance(b.content, pd.DataFrame)
+    ]
+    b06_idxs = [
+        idx
+        for idx in table_idxs
+        if looks_like_b06_cd02_table(out[idx].content)  # type: ignore[arg-type]
+    ]
+    if len(b06_idxs) <= 1:
+        return out
+
+    b06_tables = [out[idx].content for idx in b06_idxs]
+    assert all(isinstance(t, pd.DataFrame) for t in b06_tables)
+    merged_list = merge_b06_cd02_tables(b06_tables)  # type: ignore[arg-type]
+    if len(merged_list) != 1:
+        return out
+    merged = merged_list[0]
+
+    new_out: list[AssembledBlock] = []
+    first_b06 = b06_idxs[0]
+    b06_set = set(b06_idxs)
+    for idx, block in enumerate(out):
+        if idx == first_b06:
+            new_out.append(AssembledBlock(kind="table", content=merged))
+            continue
+        if idx in b06_set:
+            continue
+        new_out.append(block)
+    return new_out
 
 
 def compose_document_txt(

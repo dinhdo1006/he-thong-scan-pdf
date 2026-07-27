@@ -80,16 +80,19 @@ _GROUP_HEADER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Official B06/CD_02 data columns (A B 1..7).
+# "Trong đó Chấp hành viên đã giải quyết..." is a GROUP title over cols 2–5,
+# not a data column of its own.
 _B06_CANONICAL_HEADERS = [
     "Số TT A",
     "Tiêu chí trong quyết định thi hành án B",
     "Tổng số tiền, giá trị tài sản phải thi hành 1",
-    "Trong đó Chấp hành viên 2",
-    "Ủy thác THA 3",
-    "Trả đơn THA 4",
-    "Đình chỉ THA 5",
-    "Miễn, giảm THA 6",
-    "7",
+    "Ủy thác THA 2",
+    "Trả đơn THA 3",
+    "Đình chỉ THA 4",
+    "Miễn, giảm THA 5",
+    "Số thực thu thi hành án 6",
+    "Số đã nộp Nhà nước và chi trả 7",
 ]
 
 
@@ -497,6 +500,89 @@ def canonicalize_b06_cd02_headers(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _stt_cell(row: Sequence[object], stt_idx: int = 0) -> str:
+    if stt_idx >= len(row):
+        return ""
+    return normalize_outline_token(row[stt_idx])
+
+
+def merge_b06_cd02_tables(tables: list[pd.DataFrame]) -> list[pd.DataFrame]:
+    """
+    Force-merge all detected B06/CD_02 tables into one grid.
+
+    Page-region assemble often inserts prose between page-1 and page-2 tables,
+    which blocks consecutive-table stitching. Deduplicate by STT, keeping the
+    richer row when the same code appears twice.
+    """
+    if len(tables) <= 1:
+        return tables
+
+    b06_idxs = [i for i, df in enumerate(tables) if looks_like_b06_cd02_table(df)]
+    if len(b06_idxs) <= 1:
+        return tables
+
+    repaired = [canonicalize_b06_cd02_headers(repair_form_table(tables[i])) for i in b06_idxs]
+    width = len(_B06_CANONICAL_HEADERS)
+    by_stt: dict[str, list[str]] = {}
+    order: list[str] = []
+    extras: list[list[str]] = []  # rows without outline codes (footer notes)
+
+    def _richer(a: list[str], b: list[str]) -> list[str]:
+        score_a = sum(1 for c in a if c.strip())
+        score_b = sum(1 for c in b if c.strip())
+        if score_b > score_a:
+            # Prefer non-empty cells from the richer row, fill gaps from the other.
+            out = list(b)
+            for i, cell in enumerate(a):
+                if i < len(out) and not out[i].strip() and cell.strip():
+                    out[i] = cell
+            return out
+        out = list(a)
+        for i, cell in enumerate(b):
+            if i < len(out) and not out[i].strip() and cell.strip():
+                out[i] = cell
+        return out
+
+    for df in repaired:
+        _, body = _matrix_from_df(df)
+        for row in body:
+            padded = list(row) + [""] * max(0, width - len(row))
+            padded = padded[:width]
+            code = _stt_cell(padded, 0)
+            if is_outline_code(code):
+                if code not in by_stt:
+                    by_stt[code] = padded
+                    order.append(code)
+                else:
+                    by_stt[code] = _richer(by_stt[code], padded)
+            elif any(c.strip() for c in padded):
+                extras.append(padded)
+
+    merged_body = [by_stt[c] for c in order] + extras
+    merged = _df_from_matrix(list(_B06_CANONICAL_HEADERS), merged_body)
+    # Preserve attrs from the first B06 table.
+    merged.attrs.update(getattr(tables[b06_idxs[0]], "attrs", {}))
+    logger.info(
+        "Merged %d B06/CD_02 tables into 1 (%d unique STT rows).",
+        len(b06_idxs),
+        len(order),
+    )
+
+    out: list[pd.DataFrame] = []
+    consumed = set(b06_idxs)
+    placed = False
+    for i, df in enumerate(tables):
+        if i in consumed:
+            if not placed:
+                out.append(merged)
+                placed = True
+            continue
+        out.append(df)
+    if not placed:
+        out.append(merged)
+    return out
+
+
 def repair_form_table(df: pd.DataFrame) -> pd.DataFrame:
     """Run the full generic layout repair pipeline on one table."""
     if df is None or len(df.columns) == 0:
@@ -607,9 +693,10 @@ def stitch_outline_continuation_tables(tables: list[pd.DataFrame]) -> list[pd.Da
     """
     Merge consecutive tables that look like multi-page outline-form continuations.
     Safe no-op when widths differ or outline order goes backwards.
+    Always force-merge B06/CD_02 fragments into one table when detected.
     """
     if len(tables) <= 1:
-        return tables
+        return merge_b06_cd02_tables(tables)
 
     stitched: list[pd.DataFrame] = [repair_form_table(tables[0])]
     for nxt in tables[1:]:
@@ -625,4 +712,4 @@ def stitch_outline_continuation_tables(tables: list[pd.DataFrame]) -> list[pd.Da
             )
         else:
             stitched.append(nxt_fixed)
-    return stitched
+    return merge_b06_cd02_tables(stitched)

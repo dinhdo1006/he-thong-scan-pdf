@@ -769,7 +769,10 @@ class UnifiedPDFPipeline:
 
         if final_tables:
             from .outline_enrichment import enrich_tables_from_pdf
+            from .table_layout import merge_b06_cd02_tables
 
+            # Page-region assemble can leave B06 fragments split by prose.
+            final_tables = merge_b06_cd02_tables(final_tables)
             final_tables = enrich_tables_from_pdf(pdf_path, final_tables)
             final_tables = annotate_tables(final_tables)
 

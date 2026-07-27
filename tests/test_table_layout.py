@@ -165,11 +165,10 @@ class TestAbsorbHeaderRows(unittest.TestCase):
         fixed = repair_form_table(df)
         cols = [str(c) for c in fixed.columns]
         self.assertTrue(any("Ủy thác" in c for c in cols))
-        # Keep the dedicated CHV column, but no longer smear sublabels into STT/B columns.
-        self.assertIn("Trong đó Chấp hành viên 2", cols)
-        # Ủy thác should land on its own canonical column 3.
+        # Canonical B06: Ủy thác is column 2 (group title is not a data column).
+        self.assertNotIn("Trong đó Chấp hành viên 2", cols)
         uy_idx = next(i for i, c in enumerate(cols) if "Ủy thác" in c)
-        self.assertEqual(cols[uy_idx], "Ủy thác THA 3")
+        self.assertEqual(cols[uy_idx], "Ủy thác THA 2")
 
     def test_canonicalizes_b06_cd02_headers(self) -> None:
         df = pd.DataFrame(
@@ -195,14 +194,43 @@ class TestAbsorbHeaderRows(unittest.TestCase):
                 "Số TT A",
                 "Tiêu chí trong quyết định thi hành án B",
                 "Tổng số tiền, giá trị tài sản phải thi hành 1",
-                "Trong đó Chấp hành viên 2",
-                "Ủy thác THA 3",
-                "Trả đơn THA 4",
-                "Đình chỉ THA 5",
-                "Miễn, giảm THA 6",
-                "7",
+                "Ủy thác THA 2",
+                "Trả đơn THA 3",
+                "Đình chỉ THA 4",
+                "Miễn, giảm THA 5",
+                "Số thực thu thi hành án 6",
+                "Số đã nộp Nhà nước và chi trả 7",
             ],
         )
+
+    def test_merge_b06_tables_dedupes_stt(self) -> None:
+        from pdf_extractor.table_layout import merge_b06_cd02_tables
+
+        t1 = pd.DataFrame(
+            [
+                ["I", "Số phải thu", "10.620.000", "10.370.000", "", "", "", "250.000", "250.000"],
+                ["1", "Chủ động", "10.620.000", "10.370.000", "", "", "", "250.000", "250.000"],
+                ["1.3.1", "Thu tiền", "", "", "", "", "", "", ""],
+            ],
+            columns=[f"c{i}" for i in range(9)],
+        )
+        t2 = pd.DataFrame(
+            [
+                ["1.3.2", "Thu tài sản", "", "", "", "", "", "", ""],
+                ["2", "Theo đơn", "", "", "", "", "", "", ""],
+                ["II", "Xác định phí", "", "", "", "", "", "", ""],
+                ["III", "Chi phí", "", "", "", "", "", "", ""],
+            ],
+            columns=[f"c{i}" for i in range(9)],
+        )
+        out = merge_b06_cd02_tables([t1, t2])
+        self.assertEqual(len(out), 1)
+        stts = [str(x) for x in out[0].iloc[:, 0].tolist()]
+        self.assertEqual(stts.count("1.3.1"), 1)
+        self.assertIn("1.3.2", stts)
+        self.assertIn("III", stts)
+        self.assertEqual(list(out[0].columns)[3], "Ủy thác THA 2")
+        self.assertEqual(list(out[0].columns)[7], "Số thực thu thi hành án 6")
 
 
 if __name__ == "__main__":
