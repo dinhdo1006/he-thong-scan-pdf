@@ -410,6 +410,69 @@ def dataframe_to_rows(df: pd.DataFrame, stt_column: str) -> list[dict]:
     return rows
 
 
+def evaluate_table_semantics(
+    df: pd.DataFrame | None,
+    *,
+    emit_warnings: bool = False,
+) -> dict:
+    """
+    Run outline + sum validators silently and return a summary dict.
+
+    Returns keys:
+      - ``fail_count``: number of stt_valid=False + sum_valid=False events
+      - ``stt_fail_count`` / ``sum_fail_count``
+      - ``invalids``: list from ``list_invalid_rows``
+      - ``rows``: validated row dicts (with stt / stt_valid / sum_valid)
+      - ``by_stt``: map stt -> row dict (last wins if duplicate STT)
+    """
+    empty: dict = {
+        "fail_count": 0,
+        "stt_fail_count": 0,
+        "sum_fail_count": 0,
+        "invalids": [],
+        "rows": [],
+        "by_stt": {},
+    }
+    if df is None or len(getattr(df, "columns", [])) == 0:
+        return empty
+
+    stt_col = detect_stt_column(df)
+    if stt_col is None:
+        return empty
+
+    amount_cols = detect_amount_columns(df, stt_col)
+    rows = dataframe_to_rows(df, stt_col)
+    rows = validate_stt_outline(rows)
+    rows = validate_sum_consistency(rows, amount_cols)
+
+    if emit_warnings:
+        for row in rows:
+            stt = str(row.get("stt", "") or "").strip()
+            if row.get("stt_valid") is False:
+                issue = row.get("stt_issue") or "outline invalid"
+                logger.warning("[WARN] STT_valid=False | stt=%s | %s", stt, issue)
+            if row.get("sum_valid") is False:
+                issue = row.get("sum_issue") or f"sum_diff={row.get('sum_diff')}"
+                logger.warning("[WARN] Sum_check=FAIL | stt=%s | %s", stt, issue)
+
+    invalids = list_invalid_rows(rows)
+    by_stt = {
+        str(r.get("stt", "") or "").strip(): r
+        for r in rows
+        if str(r.get("stt", "") or "").strip()
+    }
+    stt_fails = sum(1 for i in invalids if i.get("kind") == "stt")
+    sum_fails = sum(1 for i in invalids if i.get("kind") == "sum")
+    return {
+        "fail_count": len(invalids),
+        "stt_fail_count": stt_fails,
+        "sum_fail_count": sum_fails,
+        "invalids": invalids,
+        "rows": rows,
+        "by_stt": by_stt,
+    }
+
+
 def annotate_dataframe_semantics(df: pd.DataFrame) -> pd.DataFrame:
     """
     Run outline + sum validators and append ``STT_valid`` / ``Sum_check`` columns.
@@ -420,26 +483,22 @@ def annotate_dataframe_semantics(df: pd.DataFrame) -> pd.DataFrame:
         return df
 
     out = df.copy()
-    stt_col = detect_stt_column(out)
-    if stt_col is None:
-        out["STT_valid"] = True
-        out["Sum_check"] = "N/A"
-        return out
-
-    amount_cols = detect_amount_columns(out, stt_col)
-    rows = dataframe_to_rows(out, stt_col)
-    rows = validate_stt_outline(rows)
-    rows = validate_sum_consistency(rows, amount_cols)
+    report = evaluate_table_semantics(out, emit_warnings=True)
+    if not report["rows"]:
+        stt_col = detect_stt_column(out)
+        if stt_col is None:
+            out["STT_valid"] = True
+            out["Sum_check"] = "N/A"
+            return out
 
     stt_valid_flags: list[bool] = []
     sum_checks: list[str] = []
-    for row in rows:
+    for row in report["rows"]:
         stt = str(row.get("stt", "") or "").strip()
         stt_ok = bool(row.get("stt_valid", True))
         stt_valid_flags.append(stt_ok)
         if not stt_ok:
             issue = row.get("stt_issue") or "outline invalid"
-            logger.warning("[WARN] STT_valid=False | stt=%s | %s", stt, issue)
             print(f"[WARN] STT_valid=False | stt={stt} | {issue}", flush=True)
 
         sum_ok = bool(row.get("sum_valid", True))
@@ -452,11 +511,14 @@ def annotate_dataframe_semantics(df: pd.DataFrame) -> pd.DataFrame:
             label = f"FAIL:Δ={sum_diff:g}"
             sum_checks.append(label)
             issue = row.get("sum_issue") or label
-            logger.warning("[WARN] Sum_check=FAIL | stt=%s | %s", stt, issue)
             print(f"[WARN] Sum_check=FAIL | stt={stt} | {issue}", flush=True)
 
-    out["STT_valid"] = stt_valid_flags
-    out["Sum_check"] = sum_checks
+    if report["rows"]:
+        out["STT_valid"] = stt_valid_flags
+        out["Sum_check"] = sum_checks
+    else:
+        out["STT_valid"] = True
+        out["Sum_check"] = "N/A"
     return out
 
 

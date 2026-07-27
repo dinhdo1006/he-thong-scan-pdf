@@ -27,3 +27,9 @@ qwen-vl-utils>=0.0.8
 paddlepaddle==3.2.2
 paddleocr>=3.0.0
 paddlex[ocr]>=3.0.0
+
+# --- PaddleOCR-VL (Wave 2 Tier 1; optional, GPU/VRAM recommended) ---
+# Comes with recent paddleocr builds that export `PaddleOCRVL`.
+# Force on: `--backend paddle-vl` or FORCE_PADDLE_VL=1
+# Skip: `--skip-paddle-vl` or SKIP_PADDLE_VL=1
+# Pause Ollama / other VLMs when running to free VRAM.

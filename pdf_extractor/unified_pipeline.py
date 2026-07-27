@@ -2,9 +2,10 @@
 Unified Generic Pipeline: content-driven orchestration for ANY input PDF.
 
 Every PDF goes through the same fixed sequence:
-    Step A (always):     Marker           -> document Markdown (prose + anchors).
+    Step A (always):     Marker (or PyMuPDF when skipped) -> Markdown / prose.
     Step B (always):     pdfplumber/visual scan -> which pages contain a table.
-    Step C (if B found): Docling TableFormer -> Paddle -> grid.
+    Step C (if B found): PaddleOCR-VL (Tier 1) -> Docling -> Paddle PP-Structure
+                         -> pdfplumber grid; pick per page via semantic+geometry.
 
 On Windows CPU, Marker (torch) and Paddle collide in one process -- Step A and
 the Paddle branch of Step C run in isolated subprocesses.
@@ -17,6 +18,7 @@ If GPU/ML table backends fail, Marker's table blocks are kept with a loud warnin
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -50,8 +52,17 @@ from .markdown_parser import MarkdownBlockParser
 from .paddle_extractor import PaddleExtractionError
 from .paddle_extractor import extract as paddle_extract
 from .paddle_extractor import extract_with_pages as paddle_extract_with_pages
-from .text_fallback import extract_plaintext_fallback, plaintext_as_markdown
-from .table_quality import LOW_QUALITY_THRESHOLD, pick_better_table, score_table_quality
+from .text_fallback import (
+    extract_page_prose_regions,
+    extract_plaintext_fallback,
+    plaintext_as_markdown,
+)
+from .table_quality import (
+    LOW_QUALITY_THRESHOLD,
+    pick_better_table,
+    rebind_table_tokens_to_grid,
+    score_table_quality,
+)
 from .semantic_validator import annotate_tables
 
 try:
@@ -63,11 +74,26 @@ except ImportError:  # pragma: no cover - optional dependency
     DoclingTableExtractor = None  # type: ignore[misc, assignment]
     _DOCLING_AVAILABLE = False
 
+try:
+    from .paddle_vl_extractor import (
+        PaddleVLExtractionError,
+        extract_with_pages as paddle_vl_extract_with_pages,
+        paddle_vl_available,
+    )
+
+    _PADDLE_VL_IMPORTABLE = True
+except ImportError:  # pragma: no cover
+    PaddleVLExtractionError = RuntimeError  # type: ignore[misc, assignment]
+    paddle_vl_extract_with_pages = None  # type: ignore[misc, assignment]
+    paddle_vl_available = lambda: False  # type: ignore[misc, assignment]
+    _PADDLE_VL_IMPORTABLE = False
+
 logger = logging.getLogger(__name__)
 
 BACKEND_NONE = "none"
 BACKEND_DOCLING = "docling"
 BACKEND_VLM = "vlm"  # retained for backward-compatible result labels only
+BACKEND_PADDLE_VL = "paddle-vl"
 BACKEND_PADDLE = "paddle"
 BACKEND_HYBRID = "docling+paddle"  # some pages from Docling, gaps filled by Paddle
 BACKEND_GRID = "grid"
@@ -92,6 +118,31 @@ class UnifiedResult:
 def _needs_process_isolation() -> bool:
     """True when Marker/torch and Paddle must not share one interpreter."""
     return sys.platform.startswith("win")
+
+
+def _tag_page(df: pd.DataFrame, page_no: int) -> pd.DataFrame:
+    out = df.copy()
+    out.attrs["page_no"] = int(page_no)
+    return out
+
+
+def _backend_label(sources: Dict[int, str]) -> str:
+    used = set(sources.values())
+    if not used:
+        return BACKEND_NONE
+    if used == {BACKEND_DOCLING}:
+        return BACKEND_DOCLING
+    if used == {BACKEND_PADDLE}:
+        return BACKEND_PADDLE
+    if used == {BACKEND_PADDLE_VL}:
+        return BACKEND_PADDLE_VL
+    if used == {BACKEND_GRID}:
+        return BACKEND_GRID
+    if BACKEND_PADDLE_VL in used and used <= {BACKEND_PADDLE_VL, BACKEND_DOCLING, BACKEND_PADDLE}:
+        return "paddle-vl+hybrid" if len(used) > 1 else BACKEND_PADDLE_VL
+    if used <= {BACKEND_DOCLING, BACKEND_PADDLE}:
+        return BACKEND_HYBRID
+    return "+".join(sorted(used))
 
 
 def _run_paddle_fallback(pdf_path: Path, out_dir: Path) -> List[pd.DataFrame]:
@@ -125,6 +176,10 @@ def _run_grid_fallback(pdf_path: Path, out_dir: Path, table_settings: dict) -> L
         tmp_path.unlink(missing_ok=True)
 
 
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes"}
+
+
 class UnifiedPDFPipeline:
     """Content-driven orchestrator: txt + xlsx primary, optional docx."""
 
@@ -136,12 +191,25 @@ class UnifiedPDFPipeline:
         skip_marker: Optional[bool] = None,
         force_marker: bool = False,
         docling_no_ocr: bool = False,
+        skip_paddle_vl: Optional[bool] = None,
+        force_paddle_vl: bool = False,
+        rebind_tokens: Optional[bool] = None,
     ) -> None:
         self.marker = marker_extractor or MarkerExtractor()
         self.table_settings = table_settings
         self.skip_marker = skip_marker
         self.force_marker = force_marker
         self.docling_no_ocr = bool(docling_no_ocr)
+        self.skip_paddle_vl = skip_paddle_vl
+        self.force_paddle_vl = bool(force_paddle_vl)
+        if rebind_tokens is None:
+            rebind_tokens = _env_flag("REBIND_TABLE_TOKENS")
+        self.rebind_tokens = bool(rebind_tokens)
+
+    def _ensure_page_tag(self, df: pd.DataFrame, page_no: int) -> pd.DataFrame:
+        if getattr(df, "attrs", {}).get("page_no") is None:
+            df.attrs["page_no"] = int(page_no)
+        return df
 
     def _detect_table_pages(self, pdf_path: Path) -> List[int]:
         return detect_table_pages(pdf_path, table_settings=self.table_settings)
@@ -150,7 +218,7 @@ class UnifiedPDFPipeline:
         if _skip_marker(skip_marker=self.skip_marker, force_marker=self.force_marker):
             logger.info(
                 "Skipping Marker (default on CPU / SKIP_MARKER). "
-                "Using PyMuPDF prose; tables still come from Docling/Paddle. "
+                "Using PyMuPDF prose; tables still come from Docling/Paddle/VL. "
                 "Set FORCE_MARKER=1 or pass --force-marker to enable Marker."
             )
             return plaintext_as_markdown(extract_plaintext_fallback(pdf_path))
@@ -169,19 +237,118 @@ class UnifiedPDFPipeline:
             logger.warning("Marker failed (%s) -- using PyMuPDF text fallback.", exc)
             return plaintext_as_markdown(extract_plaintext_fallback(pdf_path))
 
+    def _should_try_paddle_vl(self) -> bool:
+        """Tier 1 when VL is importable, unless explicitly skipped."""
+        if getattr(self, "force_paddle_vl", False) or _env_flag("FORCE_PADDLE_VL"):
+            return True
+        if _env_flag("SKIP_PADDLE_VL"):
+            return False
+        skip_vl = getattr(self, "skip_paddle_vl", None)
+        if skip_vl is True:
+            return False
+        # skip_vl False or None: attempt when package is available (Wave 2 Tier 1).
+        if not _PADDLE_VL_IMPORTABLE or paddle_vl_extract_with_pages is None:
+            return False
+        try:
+            return bool(paddle_vl_available())
+        except Exception:
+            return False
+
+    def _try_paddle_vl(
+        self,
+        pdf_path: Path,
+        page_indices: List[int],
+    ) -> Dict[int, pd.DataFrame]:
+        if not self._should_try_paddle_vl():
+            return {}
+        try:
+            logger.info(
+                "Table backend: trying PaddleOCR-VL (Tier 1) on page(s) %s...",
+                [p + 1 for p in page_indices],
+            )
+            pairs = paddle_vl_extract_with_pages(pdf_path, page_indices=page_indices)
+            by_page: Dict[int, pd.DataFrame] = {}
+            for page_no, df in pairs:
+                if df is None or df.empty:
+                    continue
+                by_page[int(page_no)] = self._ensure_page_tag(df, int(page_no))
+            logger.info("PaddleOCR-VL extracted %d page table(s).", len(by_page))
+            return by_page
+        except (PaddleVLExtractionError, FileNotFoundError, OSError, RuntimeError) as exc:
+            logger.warning("PaddleOCR-VL unavailable/failed (%s) -- continuing cascade.", exc)
+        except Exception as exc:
+            logger.warning("PaddleOCR-VL unavailable/failed (%s) -- continuing cascade.", exc)
+        return {}
+
+    def _maybe_rebind(
+        self,
+        pdf_path: Path,
+        tables: List[pd.DataFrame],
+        *,
+        bbox_by_page: Optional[Dict[int, tuple[float, float, float, float]]] = None,
+    ) -> List[pd.DataFrame]:
+        if not getattr(self, "rebind_tokens", False):
+            return tables
+        out: List[pd.DataFrame] = []
+        for df in tables:
+            page_no = getattr(df, "attrs", {}).get("page_no")
+            if page_no is None:
+                out.append(df)
+                continue
+            try:
+                page_index = int(page_no)
+            except (TypeError, ValueError):
+                out.append(df)
+                continue
+            table_bbox = (bbox_by_page or {}).get(page_index)
+            rebound = rebind_table_tokens_to_grid(
+                pdf_path,
+                page_index,
+                df,
+                table_bbox,
+            )
+            out.append(rebound if rebound is not None else df)
+        return out
+
+    def _merge_vl_semantic(
+        self,
+        merged: Dict[int, pd.DataFrame],
+        sources: Dict[int, str],
+        vl_by_page: Dict[int, pd.DataFrame],
+        out_dir: Path,
+    ) -> None:
+        if not vl_by_page:
+            return
+        for page_no, vl_df in vl_by_page.items():
+            base = merged.get(page_no)
+            if base is None:
+                merged[page_no] = self._ensure_page_tag(vl_df, page_no)
+                sources[page_no] = BACKEND_PADDLE_VL
+                continue
+            base_label = sources.get(page_no, "base")
+            chosen, winner = pick_better_table(
+                base,
+                vl_df,
+                use_semantic=True,
+                left_label=base_label,
+                right_label="paddle-vl",
+                conflict_dir=out_dir,
+                page_no=page_no,
+            )
+            if winner == "right":
+                sources[page_no] = BACKEND_PADDLE_VL
+            merged[page_no] = self._ensure_page_tag(chosen, page_no)
+
     def _extract_tables(
         self,
         pdf_path: Path,
         out_dir: Path,
         page_indices: List[int],
     ) -> Tuple[List[pd.DataFrame], str]:
-        # --- Docling TableFormer (offline, CPU/GPU; primary table backend) ---
-        # Cascade operates PER PAGE, not just per document: if Docling drops
-        # one page's table (misaligned grid) but successfully extracts
-        # another page's, we must NOT silently ship the document missing
-        # that page's data just because *some* table came back.
+        vl_by_page = self._try_paddle_vl(pdf_path, page_indices)
+
         docling_by_page: Dict[int, pd.DataFrame] = {}
-        docling_unplaced: List[pd.DataFrame] = []  # tables with unknown page_no
+        docling_unplaced: List[pd.DataFrame] = []
         if not _DOCLING_AVAILABLE or DoclingTableExtractor is None:
             logger.warning(
                 "Docling is not installed -- skipping TableFormer. "
@@ -231,8 +398,6 @@ class UnifiedPDFPipeline:
                 breakdown,
                 df.head(5).to_dict("records") if df is not None and not df.empty else [],
             )
-        # Same document, wildly different widths usually means one page collapsed
-        # (e.g. 9-col + 3-col) -- challenge with Paddle so stitch can align later.
         docling_widths = [len(df.columns) for df in docling_by_page.values()]
         width_inconsistent = (
             bool(docling_widths)
@@ -252,11 +417,20 @@ class UnifiedPDFPipeline:
 
         if docling_by_page and not need_paddle:
             logger.info(
-                "Docling covered every detected table page with acceptable quality "
-                "-- no Paddle comparison needed."
+                "Docling covered every detected table page with acceptable quality."
             )
-            ordered = [docling_by_page[p] for p in sorted(docling_by_page)] + docling_unplaced
-            return ordered, BACKEND_DOCLING
+            merged: Dict[int, pd.DataFrame] = {
+                p: self._ensure_page_tag(docling_by_page[p], p) for p in docling_by_page
+            }
+            sources: Dict[int, str] = {p: BACKEND_DOCLING for p in docling_by_page}
+            if vl_by_page:
+                logger.info(
+                    "Merging PaddleOCR-VL via semantic pick (Docling baseline)."
+                )
+                self._merge_vl_semantic(merged, sources, vl_by_page, out_dir)
+            ordered = [merged[p] for p in sorted(merged)] + docling_unplaced
+            ordered = self._maybe_rebind(pdf_path, ordered)
+            return ordered, _backend_label(sources)
 
         if weak_pages:
             logger.warning(
@@ -276,35 +450,46 @@ class UnifiedPDFPipeline:
         elif not docling_by_page:
             logger.warning("Docling returned 0 usable tables -- falling back to PaddleOCR.")
 
-        # --- PaddleOCR PP-Structure: gap-fill + quality challenge ---
         try:
             logger.info("Table backend: trying PaddleOCR PP-Structure...")
             paddle_pages = _run_paddle_fallback_with_pages(pdf_path, out_dir)
             paddle_by_page = {page_no: df for page_no, df in paddle_pages}
-            merged: Dict[int, pd.DataFrame] = {}
-            sources: Dict[int, str] = {}
+            merged = {}
+            sources = {}
 
-            all_pages = sorted(set(page_indices) | set(docling_by_page) | set(paddle_by_page))
+            all_pages = sorted(
+                set(page_indices) | set(docling_by_page) | set(paddle_by_page) | set(vl_by_page)
+            )
             for page_no in all_pages:
                 d_df = docling_by_page.get(page_no)
                 p_df = paddle_by_page.get(page_no)
                 if d_df is None and p_df is None:
+                    if page_no in vl_by_page:
+                        merged[page_no] = self._ensure_page_tag(vl_by_page[page_no], page_no)
+                        sources[page_no] = BACKEND_PADDLE_VL
                     continue
                 if d_df is not None and p_df is not None:
-                    chosen, winner = pick_better_table(d_df, p_df)
+                    chosen, winner = pick_better_table(
+                        d_df,
+                        p_df,
+                        use_semantic=True,
+                        left_label="docling",
+                        right_label="paddle",
+                        conflict_dir=out_dir,
+                        page_no=page_no,
+                    )
                     sources[page_no] = BACKEND_PADDLE if winner == "right" else BACKEND_DOCLING
                     merged[page_no] = chosen
                     d_score, d_breakdown = score_table_quality(d_df, return_breakdown=True)
                     p_score, p_breakdown = score_table_quality(p_df, return_breakdown=True)
                     logger.info(
-                        "Page %d: Docling score=%.2f, Paddle score=%.2f -> %s",
+                        "Page %d: Docling score=%.2f, Paddle score=%.2f -> %s "
+                        "(semantic+geometric pick)",
                         page_no + 1,
                         d_score,
                         p_score,
                         sources[page_no],
                     )
-                    # DEBUG-only: inspect why Docling may score ~0 without
-                    # changing pick/score math (enable with -v / --verbose).
                     logger.debug(
                         "Page %d Docling candidate shape=%s columns=%s",
                         page_no + 1,
@@ -315,21 +500,9 @@ class UnifiedPDFPipeline:
                         head_records = d_df.head(5).to_dict("records")
                     except Exception as exc:  # pragma: no cover - defensive
                         head_records = [{"_error": str(exc)}]
-                    logger.debug(
-                        "Page %d Docling head(5)=%s",
-                        page_no + 1,
-                        head_records,
-                    )
-                    logger.debug(
-                        "Page %d Docling score breakdown=%s",
-                        page_no + 1,
-                        d_breakdown,
-                    )
-                    logger.debug(
-                        "Page %d Paddle score breakdown=%s",
-                        page_no + 1,
-                        p_breakdown,
-                    )
+                    logger.debug("Page %d Docling head(5)=%s", page_no + 1, head_records)
+                    logger.debug("Page %d Docling score breakdown=%s", page_no + 1, d_breakdown)
+                    logger.debug("Page %d Paddle score breakdown=%s", page_no + 1, p_breakdown)
                 elif p_df is not None:
                     merged[page_no] = p_df
                     sources[page_no] = BACKEND_PADDLE
@@ -337,15 +510,11 @@ class UnifiedPDFPipeline:
                     merged[page_no] = d_df  # type: ignore[assignment]
                     sources[page_no] = BACKEND_DOCLING
 
+            self._merge_vl_semantic(merged, sources, vl_by_page, out_dir)
+
             still_missing = [p for p in page_indices if p not in merged]
             if merged:
-                used = set(sources.values())
-                if used == {BACKEND_DOCLING}:
-                    backend = BACKEND_DOCLING
-                elif used == {BACKEND_PADDLE}:
-                    backend = BACKEND_PADDLE
-                else:
-                    backend = BACKEND_HYBRID
+                backend = _backend_label(sources)
                 if still_missing:
                     logger.error(
                         "Page(s) %s still have no valid table after Docling + "
@@ -356,6 +525,7 @@ class UnifiedPDFPipeline:
                 else:
                     logger.info("Per-page quality merge complete (backend=%s).", backend)
                 ordered = [merged[p] for p in sorted(merged)] + docling_unplaced
+                ordered = self._maybe_rebind(pdf_path, ordered)
                 return ordered, backend
             logger.warning("PaddleOCR found no tables -- falling back to pdfplumber grid.")
         except (PaddleExtractionError, RuntimeError, OSError) as exc:
@@ -365,24 +535,36 @@ class UnifiedPDFPipeline:
                 exc,
             )
 
-        if docling_by_page:
-            # Paddle itself failed entirely, but Docling still got *some*
-            # pages right -- better to ship those than nothing at all.
-            logger.warning(
-                "PaddleOCR fallback failed -- shipping the %d Docling page(s) that "
-                "did succeed; page(s) %s remain missing.",
-                len(docling_by_page),
-                [p + 1 for p in missing_pages],
-            )
-            ordered = [docling_by_page[p] for p in sorted(docling_by_page)] + docling_unplaced
-            return ordered, BACKEND_DOCLING
+        if docling_by_page or vl_by_page:
+            merged = {
+                p: self._ensure_page_tag(docling_by_page[p], p) for p in docling_by_page
+            }
+            sources = {p: BACKEND_DOCLING for p in docling_by_page}
+            self._merge_vl_semantic(merged, sources, vl_by_page, out_dir)
+            if merged:
+                logger.warning(
+                    "PaddleOCR fallback failed -- shipping %d merged page(s); "
+                    "page(s) %s may remain missing.",
+                    len(merged),
+                    [p + 1 for p in missing_pages],
+                )
+                ordered = [merged[p] for p in sorted(merged)] + docling_unplaced
+                ordered = self._maybe_rebind(pdf_path, ordered)
+                return ordered, _backend_label(sources)
 
-        # --- pdfplumber lines (native/vector PDFs only; scans usually get 0) ---
         logger.info("Table backend: trying pdfplumber ruled-line grid...")
         dataframes = _run_grid_fallback(pdf_path, out_dir, self.table_settings)
         if dataframes:
             logger.info("pdfplumber grid extracted %d table(s).", len(dataframes))
-            return dataframes, BACKEND_GRID
+            tagged = []
+            for i, df in enumerate(dataframes):
+                page_guess = page_indices[i] if i < len(page_indices) else None
+                if page_guess is not None:
+                    tagged.append(self._ensure_page_tag(df, page_guess))
+                else:
+                    tagged.append(df)
+            tagged = self._maybe_rebind(pdf_path, tagged)
+            return tagged, BACKEND_GRID
 
         logger.error(
             "All image/grid table backends returned 0 tables on page(s) %s. "
@@ -401,6 +583,8 @@ class UnifiedPDFPipeline:
         skip_marker: Optional[bool] = None,
         force_marker: bool = False,
         docling_no_ocr: Optional[bool] = None,
+        skip_paddle_vl: Optional[bool] = None,
+        force_paddle_vl: bool = False,
         write_txt: bool = True,
         write_xlsx: bool = True,
         write_docx: bool = False,
@@ -417,6 +601,11 @@ class UnifiedPDFPipeline:
             self.force_marker = True
         if docling_no_ocr is not None:
             self.docling_no_ocr = bool(docling_no_ocr)
+        if skip_paddle_vl is not None:
+            self.skip_paddle_vl = skip_paddle_vl
+        if force_paddle_vl:
+            self.force_paddle_vl = True
+
         pdf_path = Path(pdf_path)
         if not pdf_path.is_file():
             raise FileNotFoundError(f"PDF not found: {pdf_path}")
@@ -442,8 +631,37 @@ class UnifiedPDFPipeline:
 
         xlsx_path = work_dir / DEFAULT_OUTPUT_XLSX
 
+        marker_skipped = _skip_marker(skip_marker=self.skip_marker, force_marker=self.force_marker)
+        page_regions = None
+        prefer_extracted = False
+        bbox_by_page: Optional[Dict[int, tuple[float, float, float, float]]] = None
+
         markdown = self._extract_markdown(pdf_path, work_dir)
         pages_with_tables = self._detect_table_pages(pdf_path)
+        marker_table_count = sum(
+            1 for b in MarkdownBlockParser().parse_blocks(markdown) if b.kind == "table"
+        )
+        use_page_regions = marker_skipped or marker_table_count == 0
+        if use_page_regions:
+            try:
+                page_regions = extract_page_prose_regions(pdf_path)
+                prefer_extracted = True
+                bbox_by_page = {
+                    r.page_index: r.table_bbox
+                    for r in page_regions
+                    if getattr(r, "table_bbox", None) is not None
+                }
+                logger.info(
+                    "Assemble mode: page bbox regions (%d page(s)); prefer extracted grids.",
+                    len(page_regions),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Page prose regions failed (%s) -- falling back to markdown assemble.",
+                    exc,
+                )
+                page_regions = None
+                prefer_extracted = marker_skipped
 
         dataframes: List[pd.DataFrame] = []
         backend = BACKEND_NONE
@@ -467,8 +685,10 @@ class UnifiedPDFPipeline:
                 logger.error("Table extraction failed: %s", exc)
                 dataframes, backend = [], BACKEND_FAILED
 
+            if getattr(self, "rebind_tokens", False) and dataframes and bbox_by_page is not None:
+                dataframes = self._maybe_rebind(pdf_path, dataframes, bbox_by_page=bbox_by_page)
+
             if not dataframes:
-                # Marker is skipped by default -- do NOT pretend Marker saved us.
                 used_marker_fallback = False
                 backend = BACKEND_FAILED
                 logger.error(
@@ -483,17 +703,33 @@ class UnifiedPDFPipeline:
         written_docx: Optional[Path] = None
         if write_docx or want_docx_primary:
             written_docx, final_tables = export_document_from_markdown(
-                markdown, dataframes, docx_path, apply_ocr_cleanup=True
+                markdown,
+                dataframes,
+                docx_path,
+                apply_ocr_cleanup=True,
+                prefer_extracted=prefer_extracted,
+                page_regions=page_regions,
             )
         else:
-            from .exporters import assemble_document_blocks
+            from .exporters import assemble_document_blocks, assemble_document_by_page_regions
 
-            blocks = assemble_document_blocks(markdown, dataframes, apply_ocr_cleanup=True)
+            if page_regions is not None:
+                blocks = assemble_document_by_page_regions(
+                    page_regions,
+                    dataframes,
+                    apply_ocr_cleanup=True,
+                )
+            else:
+                blocks = assemble_document_blocks(
+                    markdown,
+                    dataframes,
+                    apply_ocr_cleanup=True,
+                    prefer_extracted=prefer_extracted,
+                )
             final_tables = [
                 b.content for b in blocks if b.kind == "table" and isinstance(b.content, pd.DataFrame)
             ]
 
-        # Safety net: if assemble dropped tables but backends returned grids, keep them.
         if dataframes and not final_tables:
             logger.warning(
                 "Document assembler dropped %d extracted table(s); exporting them anyway.",
@@ -501,7 +737,6 @@ class UnifiedPDFPipeline:
             )
             final_tables = list(dataframes)
 
-        # Step D+ : semantic outline / sum validation before export.
         if final_tables:
             final_tables = annotate_tables(final_tables)
 
@@ -524,7 +759,13 @@ class UnifiedPDFPipeline:
 
         written_txt: Optional[Path] = None
         if write_txt or not want_docx_primary:
-            txt_content = compose_document_txt(markdown, dataframes, apply_ocr_cleanup=True)
+            txt_content = compose_document_txt(
+                markdown,
+                dataframes,
+                apply_ocr_cleanup=True,
+                prefer_extracted=prefer_extracted,
+                page_regions=page_regions,
+            )
             written_txt = save_unified_txt(txt_content, txt_path)
 
         marker_table_count = sum(1 for _ in MarkdownBlockParser().parse_blocks(markdown) if _.kind == "table")

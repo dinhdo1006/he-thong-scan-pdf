@@ -19,8 +19,14 @@ from pdf_extractor.unified_pipeline import (
 
 
 def _pipeline() -> UnifiedPDFPipeline:
-    """Bypass `__init__` -- `_extract_tables` doesn't need Marker/table_settings."""
-    return UnifiedPDFPipeline.__new__(UnifiedPDFPipeline)
+    """Bypass `__init__` -- `_extract_tables` doesn't need Marker models."""
+    pipe = UnifiedPDFPipeline.__new__(UnifiedPDFPipeline)
+    pipe.docling_no_ocr = False
+    pipe.skip_paddle_vl = True  # unit tests mock Docling/Paddle only
+    pipe.force_paddle_vl = False
+    pipe.rebind_tokens = False
+    pipe.table_settings = {"vertical_strategy": "lines", "horizontal_strategy": "lines"}
+    return pipe
 
 
 def _clean_df(label: str) -> pd.DataFrame:

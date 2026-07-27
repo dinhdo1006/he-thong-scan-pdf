@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable, Sequence
 
 import pandas as pd
@@ -150,20 +151,138 @@ def score_table_quality(
     return final
 
 
+def _geometric_pick(
+    left: pd.DataFrame,
+    right: pd.DataFrame,
+    left_score: float,
+    right_score: float,
+) -> tuple[str, str]:
+    """Width-then-score tie-break. Returns (winner, reason)."""
+    left_cols = len(left.columns)
+    right_cols = len(right.columns)
+    gap = left_cols - right_cols
+
+    if gap >= WIDTH_PREFER_GAP and left_score >= WIDTH_MIN_SCORE:
+        return "left", (
+            f"geometric width prefer left ({left_cols} vs {right_cols} cols, "
+            f"score={left_score:.2f}>={WIDTH_MIN_SCORE})"
+        )
+    if -gap >= WIDTH_PREFER_GAP and right_score >= WIDTH_MIN_SCORE:
+        return "right", (
+            f"geometric width prefer right ({right_cols} vs {left_cols} cols, "
+            f"score={right_score:.2f}>={WIDTH_MIN_SCORE})"
+        )
+    if right_score > left_score:
+        return "right", f"geometric score right {right_score:.2f} > left {left_score:.2f}"
+    return "left", f"geometric score left {left_score:.2f} >= right {right_score:.2f}"
+
+
+def _shared_semantic_conflicts(left_report: dict, right_report: dict) -> list[dict]:
+    """
+    STT rows where BOTH candidates failed the same kind of check.
+
+    These must not be auto-resolved; they go to a debug CSV.
+    """
+    left_by = left_report.get("by_stt") or {}
+    right_by = right_report.get("by_stt") or {}
+    conflicts: list[dict] = []
+    for stt in sorted(set(left_by) & set(right_by)):
+        if not stt:
+            continue
+        lrow = left_by[stt]
+        rrow = right_by[stt]
+        if lrow.get("stt_valid") is False and rrow.get("stt_valid") is False:
+            conflicts.append(
+                {
+                    "stt": stt,
+                    "kind": "stt",
+                    "left_issue": lrow.get("stt_issue"),
+                    "right_issue": rrow.get("stt_issue"),
+                    "left_value": dict(lrow),
+                    "right_value": dict(rrow),
+                    "flag": "CONFLICT_NEEDS_MANUAL_CHECK",
+                }
+            )
+        if lrow.get("sum_valid") is False and rrow.get("sum_valid") is False:
+            conflicts.append(
+                {
+                    "stt": stt,
+                    "kind": "sum",
+                    "left_issue": lrow.get("sum_issue"),
+                    "right_issue": rrow.get("sum_issue"),
+                    "left_sum_diff": lrow.get("sum_diff"),
+                    "right_sum_diff": rrow.get("sum_diff"),
+                    "left_value": dict(lrow),
+                    "right_value": dict(rrow),
+                    "flag": "CONFLICT_NEEDS_MANUAL_CHECK",
+                }
+            )
+    return conflicts
+
+
+def write_conflict_csv(
+    conflicts: list[dict],
+    conflict_dir: str | Path,
+    *,
+    page_no: int | None = None,
+    left_label: str = "left",
+    right_label: str = "right",
+) -> Path | None:
+    """Persist shared semantic conflicts for manual review. Returns written path."""
+    if not conflicts:
+        return None
+    out_dir = Path(conflict_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    page_tag = f"page{page_no + 1}" if page_no is not None else "pageNA"
+    path = out_dir / f"conflict_{page_tag}_{left_label}_vs_{right_label}.csv"
+
+    flat_rows: list[dict] = []
+    for c in conflicts:
+        flat_rows.append(
+            {
+                "page": (page_no + 1) if page_no is not None else "",
+                "stt": c.get("stt"),
+                "kind": c.get("kind"),
+                f"{left_label}_issue": c.get("left_issue"),
+                f"{right_label}_issue": c.get("right_issue"),
+                f"{left_label}_sum_diff": c.get("left_sum_diff", ""),
+                f"{right_label}_sum_diff": c.get("right_sum_diff", ""),
+                f"{left_label}_row": str(c.get("left_value")),
+                f"{right_label}_row": str(c.get("right_value")),
+                "flag": c.get("flag") or "CONFLICT_NEEDS_MANUAL_CHECK",
+            }
+        )
+    pd.DataFrame(flat_rows).to_csv(path, index=False, encoding="utf-8-sig")
+    logger.warning(
+        "Wrote %d CONFLICT_NEEDS_MANUAL_CHECK row(s) -> %s",
+        len(flat_rows),
+        path,
+    )
+    return path
+
+
 def pick_better_table(
     left: pd.DataFrame | None,
     right: pd.DataFrame | None,
+    *,
+    use_semantic: bool = True,
+    left_label: str = "left",
+    right_label: str = "right",
+    conflict_dir: str | Path | None = None,
+    page_no: int | None = None,
 ) -> tuple[pd.DataFrame, str]:
     """
     Choose the better table between two backends for the same page.
 
     Rules (form-agnostic):
     1. Only one side present -> that side wins.
-    2. If widths differ by ``WIDTH_PREFER_GAP`` or more, prefer the **wider**
-       grid when it is not near-collapsed (score >= ``WIDTH_MIN_SCORE``).
-       This prevents a clean 3-column fragment from beating a usable 9-column
-       table and breaking later stitch/merge.
-    3. Otherwise pick the higher ``score_table_quality``.
+    2. **Semantic (primary):** run outline/sum validators on BOTH candidates;
+       fewer ``stt_valid=False`` / ``sum_valid=False`` events wins, even if the
+       geometric score is lower.
+    3. Shared failures on the same STT -> write debug CSV tagged
+       ``CONFLICT_NEEDS_MANUAL_CHECK`` (both values kept); do not treat that
+       row as a semantic win for either side.
+    4. **Geometric (secondary):** width gap prefer, then ``score_table_quality``.
 
     Returns:
         ``(dataframe, winner)`` where winner is ``"left"`` or ``"right"``.
@@ -171,22 +290,90 @@ def pick_better_table(
     if left is None and right is None:
         raise ValueError("pick_better_table() needs at least one DataFrame")
     if left is None:
+        logger.debug("pick_better_table: only %s present -> right", right_label)
         return right, "right"  # type: ignore[return-value]
     if right is None:
+        logger.debug("pick_better_table: only %s present -> left", left_label)
         return left, "left"
 
-    left_cols = len(left.columns)
-    right_cols = len(right.columns)
-    left_score = score_table_quality(left)
-    right_score = score_table_quality(right)
-    gap = left_cols - right_cols
+    left_score = float(score_table_quality(left))
+    right_score = float(score_table_quality(right))
+    reason = ""
+    winner = "left"
 
-    if gap >= WIDTH_PREFER_GAP and left_score >= WIDTH_MIN_SCORE:
-        return left, "left"
-    if -gap >= WIDTH_PREFER_GAP and right_score >= WIDTH_MIN_SCORE:
-        return right, "right"
+    if use_semantic:
+        # Local import avoids a hard cycle at module load time.
+        from .semantic_validator import evaluate_table_semantics
 
-    if right_score > left_score:
+        left_rep = evaluate_table_semantics(left, emit_warnings=False)
+        right_rep = evaluate_table_semantics(right, emit_warnings=False)
+        left_fails = int(left_rep["fail_count"])
+        right_fails = int(right_rep["fail_count"])
+        conflicts = _shared_semantic_conflicts(left_rep, right_rep)
+
+        logger.debug(
+            "pick_better_table semantic: %s fails=%d (stt=%d sum=%d), "
+            "%s fails=%d (stt=%d sum=%d), shared_conflicts=%d",
+            left_label,
+            left_fails,
+            left_rep["stt_fail_count"],
+            left_rep["sum_fail_count"],
+            right_label,
+            right_fails,
+            right_rep["stt_fail_count"],
+            right_rep["sum_fail_count"],
+            len(conflicts),
+        )
+
+        if conflicts:
+            if conflict_dir is not None:
+                write_conflict_csv(
+                    conflicts,
+                    conflict_dir,
+                    page_no=page_no,
+                    left_label=left_label,
+                    right_label=right_label,
+                )
+            else:
+                logger.warning(
+                    "Semantic CONFLICT_NEEDS_MANUAL_CHECK on %d STT row(s) "
+                    "(no conflict_dir provided): %s",
+                    len(conflicts),
+                    [c.get("stt") for c in conflicts],
+                )
+
+        if left_fails < right_fails:
+            winner = "left"
+            reason = (
+                f"semantic prefer {left_label}: fails {left_fails} < {right_fails} "
+                f"(geom scores L={left_score:.2f} R={right_score:.2f})"
+            )
+        elif right_fails < left_fails:
+            winner = "right"
+            reason = (
+                f"semantic prefer {right_label}: fails {right_fails} < {left_fails} "
+                f"(geom scores L={left_score:.2f} R={right_score:.2f})"
+            )
+        else:
+            # Equal semantic fail counts (including both-zero, or tied with conflicts).
+            # Do not invent a semantic winner for shared conflict rows — fall back
+            # to geometric for shipping a whole-page grid.
+            winner, geo_reason = _geometric_pick(left, right, left_score, right_score)
+            reason = (
+                f"semantic tied (fails={left_fails}"
+                f"{', shared_conflicts=' + str(len(conflicts)) if conflicts else ''}); "
+                f"fallback {geo_reason}"
+            )
+    else:
+        winner, reason = _geometric_pick(left, right, left_score, right_score)
+
+    logger.info(
+        "pick_better_table -> %s (%s). reason: %s",
+        left_label if winner == "left" else right_label,
+        winner,
+        reason,
+    )
+    if winner == "right":
         return right, "right"
     return left, "left"
 
@@ -337,3 +524,132 @@ def grid_to_dataframe(
     normalized = [list(row) + [""] * (width - len(row)) for row in body]
     normalized = [row[:width] for row in normalized]
     return pd.DataFrame(normalized, columns=cols)
+
+
+def uniform_cell_boxes(
+    table_bbox: tuple[float, float, float, float],
+    n_rows: int,
+    n_cols: int,
+) -> list[TableCellBox]:
+    """Build a regular row×col cell grid inside ``table_bbox`` (PDF points)."""
+    if n_rows <= 0 or n_cols <= 0:
+        return []
+    x0, y0, x1, y1 = table_bbox
+    width = max(1e-6, x1 - x0)
+    height = max(1e-6, y1 - y0)
+    cell_w = width / n_cols
+    cell_h = height / n_rows
+    cells: list[TableCellBox] = []
+    for r in range(n_rows):
+        for c in range(n_cols):
+            cells.append(
+                TableCellBox(
+                    row=r,
+                    col=c,
+                    bbox=BBox(
+                        x0 + c * cell_w,
+                        y0 + r * cell_h,
+                        x0 + (c + 1) * cell_w,
+                        y0 + (r + 1) * cell_h,
+                    ),
+                )
+            )
+    return cells
+
+
+def extract_page_text_tokens(
+    pdf_path: str | Path,
+    page_index: int,
+    clip: tuple[float, float, float, float] | None = None,
+) -> list[TextToken]:
+    """Collect PyMuPDF word tokens (with bboxes) for one page, optional clip."""
+    import fitz
+
+    pdf_path = Path(pdf_path)
+    tokens: list[TextToken] = []
+    doc = fitz.open(pdf_path)
+    try:
+        if page_index < 0 or page_index >= doc.page_count:
+            return []
+        page = doc[page_index]
+        words = page.get_text("words")  # x0, y0, x1, y1, word, block, line, word_no
+        clip_rect = fitz.Rect(*clip) if clip is not None else None
+        for w in words:
+            x0, y0, x1, y1, text = w[0], w[1], w[2], w[3], str(w[4] or "")
+            if not text.strip():
+                continue
+            if clip_rect is not None and not clip_rect.intersects(fitz.Rect(x0, y0, x1, y1)):
+                continue
+            tokens.append(TextToken(text=text, bbox=BBox(x0, y0, x1, y1)))
+    finally:
+        doc.close()
+    return tokens
+
+
+def rebind_table_tokens_to_grid(
+    pdf_path: str | Path,
+    page_index: int,
+    structure_df: pd.DataFrame,
+    table_bbox: tuple[float, float, float, float] | None = None,
+    *,
+    include_header_row: bool = True,
+) -> pd.DataFrame | None:
+    """
+    Wave 1.3: rebuild cell text by assigning page tokens into a uniform grid.
+
+    Structure (row/col counts + headers) comes from ``structure_df`` (Docling /
+    Paddle / grid). Token positions come from PyMuPDF. Returns None when the
+    page has no usable tokens or bbox cannot be resolved.
+    """
+    from .grid_table_extractor import find_table_bbox
+
+    if structure_df is None or structure_df.empty or len(structure_df.columns) == 0:
+        return None
+
+    pdf_path = Path(pdf_path)
+    bbox = table_bbox
+    if bbox is None:
+        try:
+            bbox = find_table_bbox(pdf_path, page_index)
+        except Exception as exc:
+            logger.debug("rebind: bbox probe failed page %d: %s", page_index + 1, exc)
+            bbox = None
+    if bbox is None:
+        return None
+
+    n_cols = len(structure_df.columns)
+    n_body = len(structure_df)
+    n_rows = n_body + (1 if include_header_row else 0)
+    cells = uniform_cell_boxes(bbox, n_rows, n_cols)
+    tokens = extract_page_text_tokens(pdf_path, page_index, clip=bbox)
+    if not tokens:
+        logger.debug("rebind: no tokens on page %d inside table bbox.", page_index + 1)
+        return None
+
+    grid = assign_tokens_to_cells(tokens, cells, n_rows=n_rows, n_cols=n_cols)
+    if not grid:
+        return None
+
+    if include_header_row and len(grid) >= 1:
+        # Keep backend headers when token header row is empty/noisy.
+        header_cells = [c.strip() for c in grid[0]]
+        if sum(1 for c in header_cells if c) < max(1, n_cols // 3):
+            rebound = grid_to_dataframe(grid[1:], headers=[str(c) for c in structure_df.columns])
+        else:
+            rebound = grid_to_dataframe(grid)
+    else:
+        rebound = grid_to_dataframe(grid, headers=[str(c) for c in structure_df.columns])
+
+    if rebound.empty:
+        return None
+    rebound.attrs.update(getattr(structure_df, "attrs", {}))
+    rebound.attrs["page_no"] = page_index
+    rebound.attrs["rebound_tokens"] = True
+    logger.info(
+        "Token→cell rebind page %d: structure %s -> rebound %s (%d tokens).",
+        page_index + 1,
+        structure_df.shape,
+        rebound.shape,
+        len(tokens),
+    )
+    return rebound

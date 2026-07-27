@@ -5,6 +5,7 @@ CLI entrypoint: Unified PDF -> output.txt + output_tables.xlsx.
 Usage:
     python smart_extract.py -i path/to/file.pdf -o ./output
     python smart_extract.py -i path/to/file.pdf -o ./output --docx
+    python smart_extract.py -i path/to/file.pdf -o ./output --backend paddle-vl
 """
 
 from __future__ import annotations
@@ -56,6 +57,22 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Force Docling do_ocr=False (debug without OCR text anchors). Default: OCR on.",
     )
+    parser.add_argument(
+        "--backend",
+        choices=["auto", "paddle-vl"],
+        default="auto",
+        help="Table backend preference. 'paddle-vl' forces PaddleOCR-VL Tier 1 (needs GPU/VRAM).",
+    )
+    parser.add_argument(
+        "--skip-paddle-vl",
+        action="store_true",
+        help="Skip PaddleOCR-VL Tier 1 (Docling/PP-Structure only).",
+    )
+    parser.add_argument(
+        "--rebind-tokens",
+        action="store_true",
+        help="Enable token→cell bbox rebind after structure extract (Wave 1.3).",
+    )
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging.")
     return parser
 
@@ -73,11 +90,19 @@ def main(argv: list[str] | None = None) -> int:
     if args.force_marker:
         skip_marker = False
 
+    force_paddle_vl = args.backend == "paddle-vl"
+    skip_paddle_vl = True if args.skip_paddle_vl else None
+    if force_paddle_vl:
+        skip_paddle_vl = False
+
     try:
         result = UnifiedPDFPipeline(
             skip_marker=skip_marker,
             force_marker=args.force_marker,
             docling_no_ocr=args.docling_no_ocr,
+            skip_paddle_vl=skip_paddle_vl,
+            force_paddle_vl=force_paddle_vl,
+            rebind_tokens=True if args.rebind_tokens else None,
         ).run(
             pdf_path,
             output=args.output,
@@ -85,6 +110,8 @@ def main(argv: list[str] | None = None) -> int:
             skip_marker=skip_marker,
             force_marker=args.force_marker,
             docling_no_ocr=args.docling_no_ocr,
+            skip_paddle_vl=skip_paddle_vl,
+            force_paddle_vl=force_paddle_vl,
             write_docx=args.docx,
         )
     except Exception as exc:

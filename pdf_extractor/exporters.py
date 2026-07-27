@@ -232,14 +232,28 @@ def _headers_look_garbled(columns: list[str]) -> bool:
 def merge_table_preserving_form(
     marker_df: pd.DataFrame,
     extracted_df: pd.DataFrame,
+    *,
+    prefer_extracted: bool = False,
 ) -> pd.DataFrame:
     """
     Prefer extracted cell values when shapes align; keep Marker headers / width
     when they better describe the printed form. If Marker headers look
     OCR-garbled, prefer extracted headers instead.
+
+    When ``prefer_extracted=True`` (skip-Marker / garbled skeleton), the backend
+    grid is the source of truth — do not merge with Marker OCR soup.
     """
     marker_cols = [_clean_cell_text(c) for c in marker_df.columns]
     extracted_cols = [_clean_cell_text(c) for c in extracted_df.columns]
+
+    if prefer_extracted or _headers_look_garbled(marker_cols):
+        logger.info(
+            "merge_table_preserving_form: using extracted grid as SoT "
+            "(prefer_extracted=%s, marker_garbled=%s).",
+            prefer_extracted,
+            _headers_look_garbled(marker_cols),
+        )
+        return extracted_df.copy()
 
     # Same width: take extracted body, choose the cleaner header set.
     if len(marker_cols) == len(extracted_cols) and len(marker_cols) > 0:
@@ -388,11 +402,97 @@ class AssembledBlock:
     content: str | pd.DataFrame
 
 
+def _table_page_no(df: pd.DataFrame, fallback: int | None = None) -> int | None:
+    """Read ``df.attrs['page_no']`` when present."""
+    raw = getattr(df, "attrs", {}).get("page_no")
+    if raw is None:
+        return fallback
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def assemble_document_by_page_regions(
+    page_regions: list,
+    extracted_tables: list[pd.DataFrame],
+    *,
+    apply_ocr_cleanup: bool = True,
+) -> list[AssembledBlock]:
+    """
+    Assemble document as: per page → prose above → table(s) → prose below.
+
+    Wave 1 path when Marker is skipped: no pipe-table skeleton, so place each
+    backend grid by page bbox instead of appending all tables after a merged
+    header+footer blob (which put signatures *before* the form).
+    """
+    from .text_fallback import PageProseRegion
+
+    # Group extracted tables by page_no (fallback: sequential onto regions with bbox).
+    by_page: dict[int, list[pd.DataFrame]] = {}
+    unplaced: list[pd.DataFrame] = []
+    for i, df in enumerate(extracted_tables):
+        page_no = _table_page_no(df)
+        if page_no is None:
+            unplaced.append(df)
+        else:
+            by_page.setdefault(page_no, []).append(df)
+
+    # Assign unplaced tables to pages that have a table bbox, in order.
+    bbox_pages = [
+        r.page_index
+        for r in page_regions
+        if isinstance(r, PageProseRegion) and r.table_bbox is not None
+    ]
+    if not bbox_pages:
+        bbox_pages = [r.page_index for r in page_regions]
+    for offset, df in enumerate(unplaced):
+        if not bbox_pages:
+            by_page.setdefault(offset, []).append(df)
+        else:
+            page_no = bbox_pages[min(offset, len(bbox_pages) - 1)]
+            by_page.setdefault(page_no, []).append(df)
+
+    parts: list[AssembledBlock] = []
+    for region in page_regions:
+        if not isinstance(region, PageProseRegion):
+            continue
+        above = region.above or ""
+        if apply_ocr_cleanup and above:
+            above = clean_text_ocr_errors(above)
+        if above.strip():
+            parts.append(AssembledBlock(kind="text", content=above.strip()))
+
+        for df in by_page.pop(region.page_index, []):
+            prepared = _prepare_table_df(df, apply_ocr_cleanup=apply_ocr_cleanup)
+            parts.append(AssembledBlock(kind="table", content=prepared))
+
+        below = region.below or ""
+        if apply_ocr_cleanup and below:
+            below = clean_text_ocr_errors(below)
+        if below.strip():
+            parts.append(AssembledBlock(kind="text", content=below.strip()))
+
+    # Leftover tables (page_no outside regions) — append, still SoT grids.
+    for page_no in sorted(by_page):
+        for df in by_page[page_no]:
+            prepared = _prepare_table_df(df, apply_ocr_cleanup=apply_ocr_cleanup)
+            parts.append(AssembledBlock(kind="table", content=prepared))
+            logger.info(
+                "Appended leftover page-%s extracted table %s after page regions.",
+                page_no + 1,
+                prepared.shape,
+            )
+
+    return _merge_outline_continuation_blocks(parts)
+
+
 def assemble_document_blocks(
     markdown: str,
     extracted_tables: list[pd.DataFrame],
     *,
     apply_ocr_cleanup: bool = True,
+    prefer_extracted: bool = False,
 ) -> list[AssembledBlock]:
     """
     Walk Marker blocks in reading order and produce final text/table slices.
@@ -400,6 +500,9 @@ def assemble_document_blocks(
     Same matching rules as the plain-text composer: shape score, stitch slice,
     merge preserving form. Shared by `.txt` and `.docx` exporters so position
     stays consistent across formats.
+
+    ``prefer_extracted=True`` skips Marker merge (backend grid is SoT) — used
+    when Marker was skipped or headers are known garbage.
     """
     blocks = MarkdownBlockParser().parse_blocks(markdown)
     candidates: list[pd.DataFrame | None] = list(extracted_tables)
@@ -473,7 +576,11 @@ def assemble_document_blocks(
             if sliced.empty:
                 df = marker_df
             else:
-                df = merge_table_preserving_form(marker_df, sliced)
+                df = merge_table_preserving_form(
+                    marker_df,
+                    sliced,
+                    prefer_extracted=prefer_extracted,
+                )
                 logger.debug(
                     "Table block %d: matched extracted[%d] score=%.2f -> %s",
                     seen_marker_tables,
@@ -541,12 +648,25 @@ def compose_document_txt(
     extracted_tables: list[pd.DataFrame],
     *,
     apply_ocr_cleanup: bool = True,
+    prefer_extracted: bool = False,
+    page_regions: list | None = None,
 ) -> str:
     """Build ONE plain-text document (prose + aligned pipe tables) in reading order."""
+    if page_regions is not None:
+        assembled = assemble_document_by_page_regions(
+            page_regions,
+            extracted_tables,
+            apply_ocr_cleanup=apply_ocr_cleanup,
+        )
+    else:
+        assembled = assemble_document_blocks(
+            markdown,
+            extracted_tables,
+            apply_ocr_cleanup=apply_ocr_cleanup,
+            prefer_extracted=prefer_extracted,
+        )
     parts: list[str] = []
-    for block in assemble_document_blocks(
-        markdown, extracted_tables, apply_ocr_cleanup=apply_ocr_cleanup
-    ):
+    for block in assembled:
         if block.kind == "text":
             parts.append(str(block.content))
         else:
@@ -773,11 +893,23 @@ def export_document_from_markdown(
     output_path: str | Path,
     *,
     apply_ocr_cleanup: bool = True,
+    prefer_extracted: bool = False,
+    page_regions: list | None = None,
 ) -> tuple[Path, list[pd.DataFrame]]:
     """Assemble reading-order DOCX from Marker markdown + extracted tables."""
-    blocks = assemble_document_blocks(
-        markdown, extracted_tables, apply_ocr_cleanup=apply_ocr_cleanup
-    )
+    if page_regions is not None:
+        blocks = assemble_document_by_page_regions(
+            page_regions,
+            extracted_tables,
+            apply_ocr_cleanup=apply_ocr_cleanup,
+        )
+    else:
+        blocks = assemble_document_blocks(
+            markdown,
+            extracted_tables,
+            apply_ocr_cleanup=apply_ocr_cleanup,
+            prefer_extracted=prefer_extracted,
+        )
     path = export_ordered_docx(blocks, output_path)
     tables = [
         b.content for b in blocks if b.kind == "table" and isinstance(b.content, pd.DataFrame)

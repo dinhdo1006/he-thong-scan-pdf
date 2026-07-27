@@ -113,3 +113,85 @@ def test_grid_to_dataframe_uses_first_row_as_header() -> None:
 def test_pick_better_table_requires_one_side() -> None:
     with pytest.raises(ValueError):
         pick_better_table(None, None)
+
+
+def test_pick_better_table_semantic_overrides_higher_geometric_score(tmp_path) -> None:
+    """
+    Candidate with cleaner outline wins even if geometric score is lower.
+
+    Left: high fill / clean headers but missing 1.1.6 (gap 1.1.5 -> 1.1.7).
+    Right: slightly messier headers but contiguous outline — fewer semantic fails.
+    """
+    # Left: good-looking headers, but outline gap (2 semantic stt fails if also 1.1->1.1.2).
+    left = pd.DataFrame(
+        {
+            "STT": ["1", "1.1", "1.1.1", "1.1.5", "1.1.7"],
+            "Mo_ta": ["a", "b", "c", "d", "e"],
+            "So_tien": ["100", "100", "40", "30", "30"],
+        }
+    )
+    # Right: contiguous outline through 1.1.7 — 0 outline fails.
+    right = pd.DataFrame(
+        {
+            "STT": ["1", "1.1", "1.1.1", "1.1.2", "1.1.3", "1.1.4", "1.1.5", "1.1.6", "1.1.7"],
+            "Mo_ta": ["a"] * 9,
+            "So_tien": ["10"] * 9,
+        }
+    )
+    # Force a case where left would win geometrically on fill if semantic ignored:
+    # (left is denser). Semantic must still pick right.
+    chosen, winner = pick_better_table(
+        left,
+        right,
+        use_semantic=True,
+        left_label="docling",
+        right_label="paddle",
+        conflict_dir=tmp_path,
+        page_no=0,
+    )
+    assert winner == "right"
+    assert chosen.equals(right)
+
+
+def test_pick_better_table_writes_conflict_csv_when_both_fail_same_stt(tmp_path) -> None:
+    left = pd.DataFrame(
+        {
+            "STT": ["1", "1.1", "1.1.5", "1.1.7"],
+            "So_tien": ["1000", "1000", "0", "0"],
+        }
+    )
+    right = pd.DataFrame(
+        {
+            "STT": ["1", "1.1", "1.1.5", "1.1.7"],
+            "So_tien": ["900", "900", "0", "0"],
+        }
+    )
+    _chosen, _winner = pick_better_table(
+        left,
+        right,
+        use_semantic=True,
+        left_label="docling",
+        right_label="paddle",
+        conflict_dir=tmp_path,
+        page_no=0,
+    )
+    csvs = list(tmp_path.glob("conflict_*.csv"))
+    assert len(csvs) == 1
+    body = csvs[0].read_text(encoding="utf-8-sig")
+    assert "CONFLICT_NEEDS_MANUAL_CHECK" in body
+    assert "1.1.7" in body
+
+
+def test_pick_better_table_use_semantic_false_keeps_geometric_only() -> None:
+    # Narrow clean vs wide sparse: geometric width prefers wide (right).
+    narrow = pd.DataFrame(
+        [["1.3.2", "Thu tai san", "x"]],
+        columns=["STT", "Mo_ta", "col3"],
+    )
+    wide = pd.DataFrame(
+        [["1.3.2", "Thu tai san", "", "", "", "", "", "", ""]],
+        columns=[f"c{i}" for i in range(9)],
+    )
+    chosen, winner = pick_better_table(narrow, wide, use_semantic=False)
+    assert winner == "right"
+    assert len(chosen.columns) == 9

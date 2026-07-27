@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -15,12 +16,22 @@ logger = logging.getLogger(__name__)
 _PAGE_BREAK_RE = re.compile(r"\n{3,}")
 
 
-def extract_plaintext_fallback(pdf_path: str | Path) -> str:
-    """
-    Extract prose with PyMuPDF, preferring text *outside* detected table boxes.
+@dataclass(frozen=True)
+class PageProseRegion:
+    """Prose above/below a table bbox on one PDF page (0-indexed)."""
 
-    Avoids dumping the PDF's embedded (often garbled) table OCR into the
-    final document when Paddle already supplies structured tables.
+    page_index: int
+    above: str
+    below: str
+    table_bbox: tuple[float, float, float, float] | None = None
+
+
+def extract_page_prose_regions(pdf_path: str | Path) -> list[PageProseRegion]:
+    """
+    Per-page prose split around the densest table bbox.
+
+    Used by Wave 1 assemble: emit above → table → below in reading order
+    instead of concatenating footer into the header then appending tables.
     """
     import fitz
 
@@ -30,7 +41,7 @@ def extract_plaintext_fallback(pdf_path: str | Path) -> str:
     if not pdf_path.is_file():
         raise FileNotFoundError(f"PDF not found: {pdf_path}")
 
-    parts: list[str] = []
+    regions: list[PageProseRegion] = []
     doc = fitz.open(pdf_path)
     try:
         for page_index, page in enumerate(doc):
@@ -41,37 +52,68 @@ def extract_plaintext_fallback(pdf_path: str | Path) -> str:
             except Exception as exc:
                 logger.debug("table bbox probe failed on page %d: %s", page_index + 1, exc)
 
-            page_chunks: list[str] = []
+            above = ""
+            below = ""
             if table_box is None:
-                header = _header_lines_only(page.get_text("text") or "")
-                if header:
-                    page_chunks.append(header)
+                above = _header_lines_only(page.get_text("text") or "")
             else:
                 x0, y0, x1, y1 = table_box
                 if y0 > page_rect.y0 + 8:
-                    above = fitz.Rect(page_rect.x0, page_rect.y0, page_rect.x1, max(y0 - 2, page_rect.y0))
-                    if above.height >= 4:
-                        header = _header_lines_only(page.get_text("text", clip=above) or "")
-                        if header:
-                            page_chunks.append(header)
+                    clip_above = fitz.Rect(
+                        page_rect.x0, page_rect.y0, page_rect.x1, max(y0 - 2, page_rect.y0)
+                    )
+                    if clip_above.height >= 4:
+                        above = _header_lines_only(page.get_text("text", clip=clip_above) or "")
                 if y1 < page_rect.y1 - 8:
-                    below = fitz.Rect(page_rect.x0, min(y1 + 2, page_rect.y1), page_rect.x1, page_rect.y1)
-                    if below.height >= 4:
-                        footer = _clean_footer(page.get_text("text", clip=below) or "")
-                        if footer:
-                            page_chunks.append(footer)
+                    clip_below = fitz.Rect(
+                        page_rect.x0, min(y1 + 2, page_rect.y1), page_rect.x1, page_rect.y1
+                    )
+                    if clip_below.height >= 4:
+                        below = _clean_footer(page.get_text("text", clip=clip_below) or "")
 
-            text = "\n\n".join(page_chunks).strip()
-            if text:
-                parts.append(text)
-                logger.debug("Fallback text page %d: %d chars.", page_index + 1, len(text))
+            regions.append(
+                PageProseRegion(
+                    page_index=page_index,
+                    above=(above or "").strip(),
+                    below=(below or "").strip(),
+                    table_bbox=table_box,
+                )
+            )
     finally:
         doc.close()
+
+    logger.info(
+        "Page prose regions: %d page(s) from %s (with_bbox=%d).",
+        len(regions),
+        pdf_path.name,
+        sum(1 for r in regions if r.table_bbox is not None),
+    )
+    return regions
+
+
+def extract_plaintext_fallback(pdf_path: str | Path) -> str:
+    """
+    Extract prose with PyMuPDF, preferring text *outside* detected table boxes.
+
+    Avoids dumping the PDF's embedded (often garbled) table OCR into the
+    final document when Paddle already supplies structured tables.
+
+    Note: for document assembly when Marker is skipped, prefer
+    ``extract_page_prose_regions`` so footers stay *after* tables.
+    """
+    regions = extract_page_prose_regions(pdf_path)
+    parts: list[str] = []
+    for region in regions:
+        page_chunks = [c for c in (region.above, region.below) if c]
+        text = "\n\n".join(page_chunks).strip()
+        if text:
+            parts.append(text)
+            logger.debug("Fallback text page %d: %d chars.", region.page_index + 1, len(text))
 
     body = "\n\n".join(parts)
     body = _PAGE_BREAK_RE.sub("\n\n", body).strip()
     body = _finalize_prose(body)
-    logger.info("Fallback PyMuPDF text extraction: %d chars from %s", len(body), pdf_path.name)
+    logger.info("Fallback PyMuPDF text extraction: %d chars from %s", len(body), Path(pdf_path).name)
     return body
 
 
