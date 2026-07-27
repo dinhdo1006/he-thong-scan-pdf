@@ -650,6 +650,7 @@ def compose_document_txt(
     apply_ocr_cleanup: bool = True,
     prefer_extracted: bool = False,
     page_regions: list | None = None,
+    pdf_path: str | Path | None = None,
 ) -> str:
     """Build ONE plain-text document (prose + aligned pipe tables) in reading order."""
     if page_regions is not None:
@@ -665,6 +666,25 @@ def compose_document_txt(
             apply_ocr_cleanup=apply_ocr_cleanup,
             prefer_extracted=prefer_extracted,
         )
+
+    if pdf_path is not None:
+        from .outline_enrichment import enrich_tables_from_pdf
+
+        table_dfs = [
+            b.content for b in assembled if b.kind == "table" and isinstance(b.content, pd.DataFrame)
+        ]
+        if table_dfs:
+            enriched = enrich_tables_from_pdf(pdf_path, table_dfs)
+            ei = 0
+            new_blocks: list[AssembledBlock] = []
+            for block in assembled:
+                if block.kind == "table" and isinstance(block.content, pd.DataFrame):
+                    new_blocks.append(AssembledBlock(kind="table", content=enriched[ei]))
+                    ei += 1
+                else:
+                    new_blocks.append(block)
+            assembled = new_blocks
+
     parts: list[str] = []
     for block in assembled:
         if block.kind == "text":

@@ -61,6 +61,15 @@ _STT_HEADER_HINTS = re.compile(
     re.IGNORECASE,
 )
 
+# Columns added by annotate_dataframe_semantics — never treat as STT source.
+_SEMANTIC_HELPER_COLS = {
+    "cấp",
+    "cap",
+    "stt_valid",
+    "sum_check",
+    "stt_gap",
+}
+
 
 def parse_stt_path(stt: object) -> Optional[OutlinePath]:
     """
@@ -72,10 +81,10 @@ def parse_stt_path(stt: object) -> Optional[OutlinePath]:
     """
     if stt is None or (isinstance(stt, float) and pd.isna(stt)):
         return None
-    from .table_layout import normalize_outline_token
+    from .table_layout import is_money_like, is_outline_code, normalize_outline_token
 
     text = normalize_outline_token(stt)
-    if not text:
+    if not text or is_money_like(text) or not is_outline_code(text):
         return None
     if _ROMAN_RE.fullmatch(text):
         value = _ROMAN_VALUES.get(text.upper())
@@ -369,20 +378,32 @@ def detect_stt_column(df: pd.DataFrame) -> Optional[str]:
         return None
 
     best_col: Optional[str] = None
-    best_hits = -1
+    best_score = -1
     for col in df.columns:
         name = _clean_header(col)
-        hits = sum(
-            1
-            for v in df[col]
-            if is_outline_code(v) or parse_stt_path(v) is not None
-        )
-        header_boost = 2 if _STT_HEADER_HINTS.search(name) or name.lower() in {"a", "stt"} else 0
-        score = hits + header_boost
-        if score > best_hits:
-            best_hits = score
+        name_key = name.lower().strip()
+        if name_key in _SEMANTIC_HELPER_COLS:
+            continue
+        if "cấp" in name_key or name_key == "cap":
+            continue
+
+        values = list(df[col])
+        hits = 0
+        dotted_hits = 0
+        for v in values:
+            if not (is_outline_code(v) or parse_stt_path(v) is not None):
+                continue
+            hits += 1
+            token = str(v).strip()
+            if "." in token:
+                dotted_hits += 1
+        header_boost = 5 if _STT_HEADER_HINTS.search(name) or name_key in {"a", "stt"} else 0
+        # Prefer columns that contain multi-level codes (1.1.2) over Cap (1,2,3).
+        score = hits + header_boost + dotted_hits * 3
+        if score > best_score:
+            best_score = score
             best_col = str(col)
-    if best_hits <= 0:
+    if best_score <= 0:
         return str(df.columns[0])
     return best_col
 
@@ -392,6 +413,9 @@ def detect_amount_columns(df: pd.DataFrame, stt_column: str) -> list[str]:
     cols: list[str] = []
     for col in df.columns:
         if str(col) == stt_column:
+            continue
+        name_key = _clean_header(col).lower().strip()
+        if name_key in _SEMANTIC_HELPER_COLS or "cấp" in name_key or name_key == "cap":
             continue
         money_hits = 0
         for v in df[col].tolist():

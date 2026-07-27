@@ -27,7 +27,9 @@ class TestRealignShiftedRows(unittest.TestCase):
         fixed = realign_shifted_outline_rows(df)
         self.assertEqual(fixed.iloc[1, 0], "1.1.2")
         self.assertEqual(fixed.iloc[1, 1], "Phat tien theo Ban an")
-        self.assertEqual(fixed.iloc[1, 2], "250.000")
+        # Orphan STT-leaked money goes to the RIGHTMOST amount slot, not Tổng.
+        self.assertEqual(fixed.iloc[1, 2], "")
+        self.assertEqual(fixed.iloc[1, 6], "250.000")
 
     def test_outline_shifted_right_one_column(self) -> None:
         df = pd.DataFrame(
@@ -139,6 +141,33 @@ class TestAbsorbHeaderRows(unittest.TestCase):
         self.assertTrue(any("Uy thac" in c for c in cols))
         # Labels must not be smashed onto the STT column alone.
         self.assertNotIn("so TT Uy thac", cols[0])
+
+    def test_group_header_replaced_by_positional_sublabels(self) -> None:
+        df = pd.DataFrame(
+            [
+                ["", "", "", "Ủy thác THA", "Trả đơn THA", "Đình chỉ THA", "Miễn, giảm THA", "", ""],
+                ["A", "B", "1", "2", "3", "4", "5", "6", "7"],
+                ["I", "Số phải thu", "10.620.000", "10.370.000", "", "", "", "250.000", "250.000"],
+            ],
+            columns=[
+                "Số TT",
+                "Tiêu chí",
+                "Tổng số tiền",
+                "Trong đó Chấp hành viên đã giải quyết bằng các biện pháp",
+                "",
+                "",
+                "",
+                "Số thực thu thi hành án",
+                "Số đã nộp Nhà nước",
+            ],
+        )
+        fixed = repair_form_table(df)
+        cols = [str(c) for c in fixed.columns]
+        self.assertTrue(any("Ủy thác" in c for c in cols))
+        self.assertFalse(any(c.startswith("Trong đó Chấp hành viên") and "Ủy thác" not in c for c in cols))
+        # Column codes appended; Ủy thác should sit on code 2, not shift to 3.
+        uy_idx = next(i for i, c in enumerate(cols) if "Ủy thác" in c)
+        self.assertIn("2", cols[uy_idx])
 
 
 if __name__ == "__main__":

@@ -21,9 +21,10 @@ _OUTLINE_CODE_RE = re.compile(
     r"^(?:[IVXLCDM]+|\d+(?:\.\d+)*)$",
     re.IGNORECASE,
 )
-# Vietnamese / EU style money: 10.620.000 or 10,620,000
+# Vietnamese / EU style money: 10.620.000 or 12.50 (exactly 2 decimals).
+# Do NOT match 1.1 / 1.3 — those are outline codes.
 _MONEY_LIKE_RE = re.compile(
-    r"^-?\d{1,3}(?:[.,]\d{3})+(?:[.,]\d+)?$|^-?\d+[.,]\d{1,2}$"
+    r"^-?\d{1,3}(?:[.,]\d{3})+(?:[.,]\d+)?$|^-?\d+[.,]\d{2}$"
 )
 _GENERIC_HEADER_RE = re.compile(r"^(?:col(?:_\d+)?|Column_\d+)$", re.IGNORECASE)
 _COLUMN_CODE_RE = re.compile(r"^(?:[A-Za-z]|[0-9]{1,2})$")
@@ -34,11 +35,6 @@ def _clean(value: object) -> str:
         return ""
     text = str(value).replace("\n", " ").replace("\r", " ")
     return " ".join(text.split())
-
-
-def is_outline_code(text: object) -> bool:
-    s = normalize_outline_token(text)
-    return bool(s) and bool(_OUTLINE_CODE_RE.fullmatch(s))
 
 
 def normalize_outline_token(text: object) -> str:
@@ -60,6 +56,37 @@ def normalize_outline_token(text: object) -> str:
 def is_money_like(text: object) -> bool:
     s = _clean(text)
     return bool(s) and bool(_MONEY_LIKE_RE.fullmatch(s))
+
+
+def is_outline_code(text: object) -> bool:
+    """True for Roman/dotted outline ids — never for money or dates."""
+    s = normalize_outline_token(text)
+    if not s or is_money_like(s):
+        return False
+    # Dates like 17.6.2010 / 12.10.2011
+    if re.search(r"(?:^|\.)\d{4}(?:\.|$)", s):
+        return False
+    if not _OUTLINE_CODE_RE.fullmatch(s):
+        return False
+    # Bare day numbers from "ngày 12 tháng ..." — keep 1-9 only as root codes.
+    if re.fullmatch(r"\d{2,}", s):
+        return False
+    return True
+
+
+_GROUP_HEADER_RE = re.compile(
+    r"trong\s*đ[oó]|chấp\s*hành\s*viên|đã\s*giải\s*quyết|bao\s*gồm|"
+    r"trong\s*do|chap\s*hanh\s*vien",
+    re.IGNORECASE,
+)
+
+
+def is_group_header_label(text: object) -> bool:
+    """True for spanning group titles (not a single data-column name)."""
+    s = _clean(text)
+    if len(s) < 12:
+        return False
+    return bool(_GROUP_HEADER_RE.search(s))
 
 
 def is_generic_header(name: object) -> bool:
@@ -229,17 +256,8 @@ def absorb_leading_header_rows(df: pd.DataFrame) -> pd.DataFrame:
         if len(non_empty) >= 2:
             headers = non_empty + [""] * (len(headers) - len(non_empty))
 
-    label_tokens: list[str] = []
     for row in label_rows:
-        for cell in row:
-            if cell.strip():
-                label_tokens.append(cell.strip())
-
-    empty_idxs = [
-        i for i, h in enumerate(headers) if not h.strip() or is_generic_header(h)
-    ]
-    for token, idx in zip(label_tokens, empty_idxs):
-        headers[idx] = token
+        headers = _merge_header_label_row(headers, row)
 
     for row in code_rows:
         for i, cell in enumerate(row):
@@ -263,12 +281,58 @@ def absorb_leading_header_rows(df: pd.DataFrame) -> pd.DataFrame:
     return _df_from_matrix(headers, body)
 
 
+def _merge_header_label_row(headers: list[str], label_row: list[str]) -> list[str]:
+    """
+    Merge one sub-header label row into ``headers``.
+
+    Prefer *positional* placement (label cell i → header i) so Ủy thác stays
+    under column 2. Fall back to packing into empty/group slots when the OCR
+    row is left-clustered while empties sit further right.
+    """
+    out = list(headers)
+    width = len(out)
+    row = list(label_row) + [""] * max(0, width - len(label_row))
+    row = row[:width]
+
+    non_empty_idxs = [i for i, c in enumerate(row) if c.strip()]
+    if not non_empty_idxs:
+        return out
+
+    def _slot_open(i: int) -> bool:
+        cur = out[i].strip()
+        return (not cur) or is_generic_header(cur) or is_group_header_label(cur)
+
+    positional_hits = sum(1 for i in non_empty_idxs if _slot_open(i))
+    use_positional = positional_hits / len(non_empty_idxs) >= 0.5
+
+    if use_positional:
+        for i in non_empty_idxs:
+            cell = row[i].strip()
+            cur = out[i].strip()
+            if not cur or is_generic_header(cur) or is_group_header_label(cur):
+                out[i] = cell
+            elif cell not in cur:
+                # Prefer concrete sub-label over keeping only the group title.
+                if is_group_header_label(cur) and not is_group_header_label(cell):
+                    out[i] = cell
+                else:
+                    out[i] = f"{cur} {cell}"
+        return out
+
+    # Fallback: pack non-empty tokens into open slots (legacy sparse headers).
+    label_tokens = [row[i].strip() for i in non_empty_idxs]
+    empty_idxs = [i for i in range(width) if _slot_open(i)]
+    for token, idx in zip(label_tokens, empty_idxs):
+        out[idx] = token
+    return out
+
+
 def realign_shifted_outline_rows(df: pd.DataFrame) -> pd.DataFrame:
     """
     Fix two common OCR/VLM cell-shift patterns:
 
     1) Money leaked into STT:  [250.000 | 1.1.2 | Mô tả | ...]
-       -> [1.1.2 | Mô tả | ... | 250.000 in first empty amount slot]
+       -> [1.1.2 | Mô tả | ... | 250.000 in *rightmost* empty amount slot]
 
     2) STT shifted right:      [     | 1.1.3 | Mô tả | ...]
        -> [1.1.3 | Mô tả | ...]
@@ -295,9 +359,11 @@ def realign_shifted_outline_rows(df: pd.DataFrame) -> pd.DataFrame:
             while len(rebuilt) < width:
                 rebuilt.append("")
             rebuilt = rebuilt[:width]
-            # Prefer first empty slot from column 2 rightward for the money.
+            # Prefer RIGHTMOST empty amount slot: leaked values are usually
+            # wrap from cols 6–7 of a missing previous row — putting them in
+            # the first amount column (Tổng) invents false totals (e.g. 1.1.2).
             placed = False
-            for i in range(2, width):
+            for i in range(width - 1, 1, -1):
                 if not rebuilt[i].strip():
                     rebuilt[i] = money
                     placed = True

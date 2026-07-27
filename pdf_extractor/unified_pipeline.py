@@ -768,6 +768,9 @@ class UnifiedPDFPipeline:
             final_tables = list(dataframes)
 
         if final_tables:
+            from .outline_enrichment import enrich_tables_from_pdf
+
+            final_tables = enrich_tables_from_pdf(pdf_path, final_tables)
             final_tables = annotate_tables(final_tables)
 
         written_xlsx: Optional[Path] = None
@@ -795,6 +798,7 @@ class UnifiedPDFPipeline:
                 apply_ocr_cleanup=True,
                 prefer_extracted=prefer_extracted,
                 page_regions=page_regions,
+                pdf_path=pdf_path,
             )
             written_txt = save_unified_txt(txt_content, txt_path)
 
