@@ -59,9 +59,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--backend",
-        choices=["auto", "paddle-vl"],
+        choices=["auto", "paddle", "paddle-vl"],
         default="auto",
-        help="Table backend preference. 'paddle-vl' forces PaddleOCR-VL Tier 1 (needs GPU/VRAM).",
+        help=(
+            "Table backend: auto=cascade; paddle=PP-Structure only (skip Docling/VL); "
+            "paddle-vl=force PaddleOCR-VL Tier 1."
+        ),
     )
     parser.add_argument(
         "--skip-paddle-vl",
@@ -92,6 +95,11 @@ def main(argv: list[str] | None = None) -> int:
 
     force_paddle_vl = args.backend == "paddle-vl"
     skip_paddle_vl = True if args.skip_paddle_vl else None
+    skip_docling = False
+    if args.backend == "paddle":
+        # PP-Structure only: skip Docling garbage + skip VL (needs sm_120 GPU).
+        skip_docling = True
+        skip_paddle_vl = True
     if force_paddle_vl:
         skip_paddle_vl = False
 
@@ -102,6 +110,7 @@ def main(argv: list[str] | None = None) -> int:
             docling_no_ocr=args.docling_no_ocr,
             skip_paddle_vl=skip_paddle_vl,
             force_paddle_vl=force_paddle_vl,
+            skip_docling=skip_docling,
             rebind_tokens=True if args.rebind_tokens else None,
         ).run(
             pdf_path,
@@ -112,6 +121,7 @@ def main(argv: list[str] | None = None) -> int:
             docling_no_ocr=args.docling_no_ocr,
             skip_paddle_vl=skip_paddle_vl,
             force_paddle_vl=force_paddle_vl,
+            skip_docling=skip_docling,
             write_docx=args.docx,
         )
     except Exception as exc:

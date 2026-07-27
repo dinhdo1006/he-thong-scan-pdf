@@ -24,6 +24,7 @@ def _pipeline() -> UnifiedPDFPipeline:
     pipe.docling_no_ocr = False
     pipe.skip_paddle_vl = True  # unit tests mock Docling/Paddle only
     pipe.force_paddle_vl = False
+    pipe.skip_docling = False
     pipe.rebind_tokens = False
     pipe.table_settings = {"vertical_strategy": "lines", "horizontal_strategy": "lines"}
     return pipe

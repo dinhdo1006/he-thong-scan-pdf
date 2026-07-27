@@ -210,6 +210,7 @@ class UnifiedPDFPipeline:
         docling_no_ocr: bool = False,
         skip_paddle_vl: Optional[bool] = None,
         force_paddle_vl: bool = False,
+        skip_docling: bool = False,
         rebind_tokens: Optional[bool] = None,
     ) -> None:
         self.marker = marker_extractor or MarkerExtractor()
@@ -219,6 +220,7 @@ class UnifiedPDFPipeline:
         self.docling_no_ocr = bool(docling_no_ocr)
         self.skip_paddle_vl = skip_paddle_vl
         self.force_paddle_vl = bool(force_paddle_vl)
+        self.skip_docling = bool(skip_docling)
         if rebind_tokens is None:
             rebind_tokens = _env_flag("REBIND_TABLE_TOKENS")
         self.rebind_tokens = bool(rebind_tokens)
@@ -364,43 +366,50 @@ class UnifiedPDFPipeline:
     ) -> Tuple[List[pd.DataFrame], str]:
         vl_by_page = self._try_paddle_vl(pdf_path, page_indices)
 
-        _probe_docling()  # lazy import of Docling/torch — safe on Linux CPU
         docling_by_page: Dict[int, pd.DataFrame] = {}
         docling_unplaced: List[pd.DataFrame] = []
-        if not _DOCLING_AVAILABLE or DoclingTableExtractor is None:
-            logger.warning(
-                "Docling is not installed -- skipping TableFormer. "
-                "Install with: pip install 'docling>=2.0.0' 'docling-core>=2.0.0'"
+        skip_docling = bool(getattr(self, "skip_docling", False) or _env_flag("SKIP_DOCLING"))
+        if skip_docling:
+            logger.info(
+                "Skipping Docling (--backend paddle / SKIP_DOCLING). "
+                "Using PaddleOCR PP-Structure as primary table backend."
             )
         else:
-            try:
-                logger.info(
-                    "Table backend: trying Docling TableFormer on page(s) %s...",
-                    [p + 1 for p in page_indices],
-                )
-                extractor = DoclingTableExtractor(
-                    pdf_path,
-                    disable_ocr=self.docling_no_ocr,
-                )
-                for page_no, df in extractor.extract_with_pages():
-                    if page_no is None:
-                        docling_unplaced.append(df)
-                    else:
-                        docling_by_page[page_no] = df
-                logger.info(
-                    "Docling extracted %d table(s).",
-                    len(docling_by_page) + len(docling_unplaced),
-                )
-            except (DoclingExtractionError, FileNotFoundError, OSError, RuntimeError) as exc:
+            _probe_docling()  # lazy import of Docling/torch — safe on Linux CPU
+            if not _DOCLING_AVAILABLE or DoclingTableExtractor is None:
                 logger.warning(
-                    "Docling unavailable/failed (%s) -- falling back to PaddleOCR.",
-                    exc,
+                    "Docling is not installed -- skipping TableFormer. "
+                    "Install with: pip install 'docling>=2.0.0' 'docling-core>=2.0.0'"
                 )
-            except Exception as exc:
-                logger.warning(
-                    "Docling unavailable/failed (%s) -- falling back to PaddleOCR.",
-                    exc,
-                )
+            else:
+                try:
+                    logger.info(
+                        "Table backend: trying Docling TableFormer on page(s) %s...",
+                        [p + 1 for p in page_indices],
+                    )
+                    extractor = DoclingTableExtractor(
+                        pdf_path,
+                        disable_ocr=self.docling_no_ocr,
+                    )
+                    for page_no, df in extractor.extract_with_pages():
+                        if page_no is None:
+                            docling_unplaced.append(df)
+                        else:
+                            docling_by_page[page_no] = df
+                    logger.info(
+                        "Docling extracted %d table(s).",
+                        len(docling_by_page) + len(docling_unplaced),
+                    )
+                except (DoclingExtractionError, FileNotFoundError, OSError, RuntimeError) as exc:
+                    logger.warning(
+                        "Docling unavailable/failed (%s) -- falling back to PaddleOCR.",
+                        exc,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Docling unavailable/failed (%s) -- falling back to PaddleOCR.",
+                        exc,
+                    )
 
         missing_pages = [p for p in page_indices if p not in docling_by_page]
         weak_pages = []
@@ -603,6 +612,7 @@ class UnifiedPDFPipeline:
         docling_no_ocr: Optional[bool] = None,
         skip_paddle_vl: Optional[bool] = None,
         force_paddle_vl: bool = False,
+        skip_docling: Optional[bool] = None,
         write_txt: bool = True,
         write_xlsx: bool = True,
         write_docx: bool = False,
@@ -623,6 +633,8 @@ class UnifiedPDFPipeline:
             self.skip_paddle_vl = skip_paddle_vl
         if force_paddle_vl:
             self.force_paddle_vl = True
+        if skip_docling is not None:
+            self.skip_docling = bool(skip_docling)
 
         pdf_path = Path(pdf_path)
         if not pdf_path.is_file():
