@@ -65,14 +65,31 @@ from .table_quality import (
 )
 from .semantic_validator import annotate_tables
 
-try:
-    from .docling_extractor import DoclingExtractionError, DoclingTableExtractor
+# Docling (+ transformers + torch) is imported lazily at first use so that
+# `smart_extract.py` starts up without hanging on Linux CPU machines that have
+# a broken/slow torch install.  _DOCLING_AVAILABLE is resolved on first call
+# to _extract_tables(), not at module import time.
+DoclingExtractionError: type = RuntimeError  # placeholder; overwritten lazily
+DoclingTableExtractor = None  # placeholder; overwritten lazily
+_DOCLING_AVAILABLE: bool | None = None  # None = not yet probed
 
-    _DOCLING_AVAILABLE = True
-except ImportError:  # pragma: no cover - optional dependency
-    DoclingExtractionError = RuntimeError  # type: ignore[misc, assignment]
-    DoclingTableExtractor = None  # type: ignore[misc, assignment]
-    _DOCLING_AVAILABLE = False
+
+def _probe_docling() -> None:
+    """Lazy one-time import of Docling so torch doesn't load at startup."""
+    global _DOCLING_AVAILABLE, DoclingExtractionError, DoclingTableExtractor
+    if _DOCLING_AVAILABLE is not None:
+        return
+    try:
+        from .docling_extractor import (  # noqa: PLC0415
+            DoclingExtractionError as _DocErr,
+            DoclingTableExtractor as _DocCls,
+        )
+        DoclingExtractionError = _DocErr  # type: ignore[assignment]
+        DoclingTableExtractor = _DocCls  # type: ignore[assignment]
+        _DOCLING_AVAILABLE = True
+    except Exception:  # ImportError or torch crash on Linux CPU
+        _DOCLING_AVAILABLE = False
+
 
 try:
     from .paddle_vl_extractor import (
@@ -347,6 +364,7 @@ class UnifiedPDFPipeline:
     ) -> Tuple[List[pd.DataFrame], str]:
         vl_by_page = self._try_paddle_vl(pdf_path, page_indices)
 
+        _probe_docling()  # lazy import of Docling/torch — safe on Linux CPU
         docling_by_page: Dict[int, pd.DataFrame] = {}
         docling_unplaced: List[pd.DataFrame] = []
         if not _DOCLING_AVAILABLE or DoclingTableExtractor is None:
