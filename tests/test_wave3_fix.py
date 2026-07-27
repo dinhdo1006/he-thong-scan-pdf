@@ -100,5 +100,35 @@ class TestAnnotateUsesRealStt(unittest.TestCase):
         self.assertTrue(bool(out["STT_valid"].all()))
 
 
+class TestB06RepairPipeline(unittest.TestCase):
+    def test_b06_header_and_hierarchy_shape(self) -> None:
+        df = pd.DataFrame(
+            [
+                ["I", "Số phải thu thi hành án", "10.620.000", "10.370.000", "", "", "", "250.000", "250.000"],
+                ["1", "Các khoản chủ động T.H.A", "10.620.000", "10.370.000", "", "", "", "250.000", "250.000"],
+                ["1.1", "Các khoản thu, nộp Nhà nước", "10.620.000", "10.370.000", "", "", "", "250.000", "250.000"],
+                ["1.1.1", "Án phí", "10.620.000", "10.370.000", "", "", "", "250.000", "250.000"],
+            ],
+            columns=[
+                "Ủy thác THA A",
+                "Trả đơn THA B",
+                "Đình chỉ THA 1",
+                "Số TT Miễn, giảm THA 2",
+                "Tiêu chí trong quyết định thi hành án 3",
+                "Tổng số tiền, giá trị tài sản phải thi hành 4",
+                "Trong đó Chấp hành viên 5",
+                "6",
+                "7",
+            ],
+        )
+        from pdf_extractor.table_layout import repair_form_table
+
+        out = annotate_dataframe_semantics(repair_form_table(df))
+        self.assertEqual(out.columns[1], "Số TT A")
+        self.assertEqual(out.columns[2], "Tiêu chí trong quyết định thi hành án B")
+        self.assertEqual(out.iloc[3]["Số TT A"], "1.1.1")
+        self.assertTrue(str(out.iloc[3]["Tiêu chí trong quyết định thi hành án B"]).startswith("    "))
+
+
 if __name__ == "__main__":
     unittest.main()

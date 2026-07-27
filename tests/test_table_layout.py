@@ -8,6 +8,7 @@ import pandas as pd
 
 from pdf_extractor.exporters import compose_document_txt
 from pdf_extractor.table_layout import (
+    canonicalize_b06_cd02_headers,
     demote_false_data_headers,
     realign_shifted_outline_rows,
     repair_form_table,
@@ -164,10 +165,44 @@ class TestAbsorbHeaderRows(unittest.TestCase):
         fixed = repair_form_table(df)
         cols = [str(c) for c in fixed.columns]
         self.assertTrue(any("Ủy thác" in c for c in cols))
-        self.assertFalse(any(c.startswith("Trong đó Chấp hành viên") and "Ủy thác" not in c for c in cols))
-        # Column codes appended; Ủy thác should sit on code 2, not shift to 3.
+        # Keep the dedicated CHV column, but no longer smear sublabels into STT/B columns.
+        self.assertIn("Trong đó Chấp hành viên 2", cols)
+        # Ủy thác should land on its own canonical column 3.
         uy_idx = next(i for i, c in enumerate(cols) if "Ủy thác" in c)
-        self.assertIn("2", cols[uy_idx])
+        self.assertEqual(cols[uy_idx], "Ủy thác THA 3")
+
+    def test_canonicalizes_b06_cd02_headers(self) -> None:
+        df = pd.DataFrame(
+            [
+                ["I", "Số phải thu", "10.620.000", "10.370.000", "", "", "", "250.000", "250.000"],
+            ],
+            columns=[
+                "Ủy thác THA A",
+                "Trả đơn THA B",
+                "Đình chỉ THA 1",
+                "Số TT Miễn, giảm THA 2",
+                "Tiêu chí trong quyết định thi hành án 3",
+                "Tổng số tiền, giá trị tài sản phải thi hành 4",
+                "Trong đó Chấp hành viên 5",
+                "6",
+                "7",
+            ],
+        )
+        fixed = canonicalize_b06_cd02_headers(df)
+        self.assertEqual(
+            list(fixed.columns),
+            [
+                "Số TT A",
+                "Tiêu chí trong quyết định thi hành án B",
+                "Tổng số tiền, giá trị tài sản phải thi hành 1",
+                "Trong đó Chấp hành viên 2",
+                "Ủy thác THA 3",
+                "Trả đơn THA 4",
+                "Đình chỉ THA 5",
+                "Miễn, giảm THA 6",
+                "7",
+            ],
+        )
 
 
 if __name__ == "__main__":

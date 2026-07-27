@@ -80,6 +80,18 @@ _GROUP_HEADER_RE = re.compile(
     re.IGNORECASE,
 )
 
+_B06_CANONICAL_HEADERS = [
+    "Số TT A",
+    "Tiêu chí trong quyết định thi hành án B",
+    "Tổng số tiền, giá trị tài sản phải thi hành 1",
+    "Trong đó Chấp hành viên 2",
+    "Ủy thác THA 3",
+    "Trả đơn THA 4",
+    "Đình chỉ THA 5",
+    "Miễn, giảm THA 6",
+    "7",
+]
+
 
 def is_group_header_label(text: object) -> bool:
     """True for spanning group titles (not a single data-column name)."""
@@ -443,6 +455,48 @@ def drop_empty_spacer_rows(df: pd.DataFrame) -> pd.DataFrame:
     return _df_from_matrix(cols, kept)
 
 
+def looks_like_b06_cd02_table(df: pd.DataFrame) -> bool:
+    """
+    Heuristic for the B06/CD_02 9-column enforcement form.
+
+    We only need a coarse detector: width 9 plus strong header/body hints.
+    """
+    if df is None or len(getattr(df, "columns", [])) != 9:
+        return False
+
+    cols, body = _matrix_from_df(df)
+    haystack = " | ".join(cols + [cell for row in body[:6] for cell in row]).lower()
+    hits = 0
+    if "số tt" in haystack or "so tt" in haystack:
+        hits += 1
+    if "tiêu chí" in haystack or "tieu chi" in haystack:
+        hits += 1
+    if "ủy thác" in haystack or "uy thac" in haystack:
+        hits += 1
+    if "trả đơn" in haystack or "tra don" in haystack:
+        hits += 1
+    if "đình chỉ" in haystack or "dinh chi" in haystack:
+        hits += 1
+    if "miễn" in haystack or "mien" in haystack:
+        hits += 1
+
+    # Also allow strong structural cues even if OCR text is noisy.
+    first_col_hits = sum(1 for row in body[:8] if row and is_outline_code(row[0]))
+    return hits >= 3 or first_col_hits >= 3
+
+
+def canonicalize_b06_cd02_headers(df: pd.DataFrame) -> pd.DataFrame:
+    """Force the known B06/CD_02 9-column header order when detected."""
+    if not looks_like_b06_cd02_table(df):
+        return df
+    if list(df.columns) == _B06_CANONICAL_HEADERS:
+        return df
+    out = df.copy()
+    out.columns = _B06_CANONICAL_HEADERS
+    logger.info("Canonicalized B06/CD_02 headers to the standard 9-column schema.")
+    return out
+
+
 def repair_form_table(df: pd.DataFrame) -> pd.DataFrame:
     """Run the full generic layout repair pipeline on one table."""
     if df is None or len(df.columns) == 0:
@@ -454,6 +508,7 @@ def repair_form_table(df: pd.DataFrame) -> pd.DataFrame:
     out = left_compact_sparse_headers(out)
     out = realign_shifted_outline_rows(out)
     out = drop_empty_spacer_rows(out)
+    out = canonicalize_b06_cd02_headers(out)
     return out
 
 
