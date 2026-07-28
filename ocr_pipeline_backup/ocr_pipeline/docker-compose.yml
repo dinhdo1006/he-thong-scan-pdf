@@ -133,6 +133,9 @@ services:
       - MINIO_ENDPOINT=http://minio:9000
       - MINIO_ACCESS_KEY=admin
       - MINIO_SECRET_KEY=Admin@123
+    volumes:
+      # Put vgg_seq2seq.pth here (from old ocr_pipeline/vietocr/weights)
+      - ./vietocr/weights:/app/weights:ro
     networks:
       - ocr-network
 
