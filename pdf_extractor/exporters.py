@@ -770,14 +770,19 @@ def export_tables_preview(
 
     # --- Excel (open with LibreOffice / Excel, not VS Code) ---
     try:
-        with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
-            if not tables:
-                pd.DataFrame({"info": [placeholder]}).to_excel(
-                    writer, sheet_name="No_Tables", index=False
-                )
-            else:
-                for idx, df in enumerate(tables, start=1):
-                    df.to_excel(writer, sheet_name=f"Table_{idx}"[:31], index=False)
+        from .b06_excel import is_b06_excel_candidate, write_b06_workbook
+
+        if tables and any(is_b06_excel_candidate(df) for df in tables):
+            write_b06_workbook(tables, xlsx_path)
+        else:
+            with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
+                if not tables:
+                    pd.DataFrame({"info": [placeholder]}).to_excel(
+                        writer, sheet_name="No_Tables", index=False
+                    )
+                else:
+                    for idx, df in enumerate(tables, start=1):
+                        df.to_excel(writer, sheet_name=f"Table_{idx}"[:31], index=False)
     except Exception as exc:
         raise IOError(f"Failed to write Excel file '{xlsx_path}': {exc}") from exc
     written["xlsx"] = xlsx_path

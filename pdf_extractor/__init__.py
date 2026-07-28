@@ -29,4 +29,4 @@ __all__ = [
     "route_and_extract",
     "PipelineChoice",
 ]
-__version__ = "6.5.2"
+__version__ = "6.6.0"
