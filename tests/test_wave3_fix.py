@@ -124,10 +124,14 @@ class TestB06RepairPipeline(unittest.TestCase):
         from pdf_extractor.table_layout import repair_form_table
 
         out = annotate_dataframe_semantics(repair_form_table(df))
-        self.assertEqual(out.columns[1], "Số TT A")
-        self.assertEqual(out.columns[2], "Tiêu chí trong quyết định thi hành án B")
+        self.assertEqual(out.columns[0], "Số TT A")
+        self.assertEqual(out.columns[1], "Tiêu chí trong quyết định thi hành án B")
         self.assertEqual(out.iloc[3]["Số TT A"], "1.1.1")
-        self.assertTrue(str(out.iloc[3]["Tiêu chí trong quyết định thi hành án B"]).startswith("    "))
+        self.assertEqual(
+            str(out.iloc[3]["Tiêu chí trong quyết định thi hành án B"]).strip(),
+            "Án phí",
+        )
+        self.assertNotIn("Cấp", out.columns)
 
 
 if __name__ == "__main__":

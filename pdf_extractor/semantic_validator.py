@@ -606,10 +606,11 @@ def annotate_dataframe_semantics(df: pd.DataFrame) -> pd.DataFrame:
     Wave 3 extras:
       - normalize OCR STT tokens (``1⁄2`` -> ``1.2``)
       - insert missing outline placeholders
-      - ``Cấp`` = hierarchy depth
-      - indent description text by depth (visual parent/child)
       - ``STT_gap`` = MISSING for placeholder rows
       - ``STT_valid`` / ``Sum_check`` as before
+
+    Note: Cap / space-indent are no longer written into the frame — B06 Excel
+    applies visual hierarchy via bold + cell indent at export time.
     """
     if df is None or len(getattr(df, "columns", [])) == 0:
         return df
@@ -617,9 +618,13 @@ def annotate_dataframe_semantics(df: pd.DataFrame) -> pd.DataFrame:
     from .table_layout import normalize_outline_token
 
     out = insert_missing_outline_placeholders(df.copy())
+    # Drop Cap if a previous pass left it behind.
+    drop_caps = [c for c in out.columns if str(c).lower().strip() in {"cấp", "cap"}]
+    if drop_caps:
+        out = out.drop(columns=drop_caps)
+
     stt_col = detect_stt_column(out)
     if stt_col is None:
-        out["Cấp"] = 0
         out["STT_valid"] = True
         out["Sum_check"] = "N/A"
         out["STT_gap"] = ""
@@ -635,23 +640,13 @@ def annotate_dataframe_semantics(df: pd.DataFrame) -> pd.DataFrame:
     else:
         gap_flags = [""] * len(out)
 
-    levels = [outline_level(v) for v in out[stt_col].tolist()]
-    if "Cấp" in out.columns:
-        out["Cấp"] = levels
-    else:
-        out.insert(0, "Cấp", levels)
-
+    # Strip space-indent left over from older annotate versions.
     desc_col = _description_column(out, stt_col)
     if desc_col is not None and desc_col in out.columns:
-        indented: list[str] = []
-        for depth, val in zip(levels, out[desc_col].tolist()):
-            text = "" if val is None or (isinstance(val, float) and pd.isna(val)) else str(val)
-            text = text.strip()
-            text = re.sub(r"^(?: {2})+", "", text)
-            if depth > 1 and text:
-                text = ("  " * (depth - 1)) + text
-            indented.append(text)
-        out[desc_col] = indented
+        out[desc_col] = [
+            re.sub(r"^(?: {2})+", "", "" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v)).strip()
+            for v in out[desc_col].tolist()
+        ]
 
     report = evaluate_table_semantics(out, emit_warnings=True)
     stt_valid_flags: list[bool] = []

@@ -60,7 +60,7 @@ class TestMissingGapsAndCap(unittest.TestCase):
         self.assertLess(stts.index("1.1.1"), stts.index("1.1.2"))
         self.assertLess(stts.index("1.1.6"), stts.index("1.1.7"))
 
-    def test_annotate_adds_cap_indent_and_gap(self) -> None:
+    def test_annotate_adds_gap_without_cap(self) -> None:
         df = pd.DataFrame(
             [
                 ["I", "Tong so", "10.620.000"],
@@ -71,15 +71,15 @@ class TestMissingGapsAndCap(unittest.TestCase):
             columns=["STT", "Mo_ta", "Tien"],
         )
         out = annotate_dataframe_semantics(df)
-        self.assertIn("Cấp", out.columns)
+        self.assertNotIn("Cấp", out.columns)
         self.assertIn("STT_gap", out.columns)
         # Placeholder 1.1.1 inserted with MISSING flag.
         gap_rows = out[out["STT"] == "1.1.1"]
         self.assertEqual(len(gap_rows), 1)
         self.assertEqual(gap_rows.iloc[0]["STT_gap"], "MISSING")
-        # Child description indented.
+        # Description is not space-indented anymore.
         row_112 = out[out["STT"] == "1.1.2"].iloc[0]
-        self.assertTrue(str(row_112["Mo_ta"]).startswith("  "))
+        self.assertFalse(str(row_112["Mo_ta"]).startswith("  "))
 
 
 class TestDropEmptyRows(unittest.TestCase):

@@ -770,18 +770,21 @@ def export_tables_preview(
 
     # --- Excel (open with LibreOffice / Excel, not VS Code) ---
     try:
-        from .b06_excel import is_b06_excel_candidate, write_b06_workbook
+        from .b06_excel import drop_semantic_helpers, is_b06_excel_candidate, write_b06_workbook
 
-        if tables and any(is_b06_excel_candidate(df) for df in tables):
+        export_tables = [drop_semantic_helpers(df) for df in tables] if tables else []
+        if export_tables and any(is_b06_excel_candidate(df) for df in tables):
+            # Writer also drops helpers; pass original so candidate detection still works,
+            # then helpers are stripped inside write_b06_workbook / flat path.
             write_b06_workbook(tables, xlsx_path)
         else:
             with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
-                if not tables:
+                if not export_tables:
                     pd.DataFrame({"info": [placeholder]}).to_excel(
                         writer, sheet_name="No_Tables", index=False
                     )
                 else:
-                    for idx, df in enumerate(tables, start=1):
+                    for idx, df in enumerate(export_tables, start=1):
                         df.to_excel(writer, sheet_name=f"Table_{idx}"[:31], index=False)
     except Exception as exc:
         raise IOError(f"Failed to write Excel file '{xlsx_path}': {exc}") from exc
@@ -793,6 +796,8 @@ def export_tables_preview(
 
     # --- CSV (one file per table; UTF-8 with BOM for Excel on Windows) ---
     if write_csv:
+        from .b06_excel import drop_semantic_helpers
+
         if not tables:
             csv_path = out_dir / f"{stem}_empty.csv"
             pd.DataFrame({"info": [placeholder]}).to_csv(
@@ -803,7 +808,7 @@ def export_tables_preview(
             csv_paths: list[Path] = []
             for idx, df in enumerate(tables, start=1):
                 csv_path = out_dir / f"{stem}_table_{idx}.csv"
-                df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+                drop_semantic_helpers(df).to_csv(csv_path, index=False, encoding="utf-8-sig")
                 csv_paths.append(csv_path)
             written["csv"] = csv_paths[0]
             logger.info("Saved %d CSV file(s) under %s", len(csv_paths), out_dir)
