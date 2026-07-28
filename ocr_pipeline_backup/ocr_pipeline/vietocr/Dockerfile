@@ -25,6 +25,8 @@ RUN pip install \
 RUN pip install -r requirements.txt
 
 COPY app.py .
-COPY weights ./weights
+# Model weights are NOT in git — mount at runtime:
+#   ./vietocr/weights:/app/weights:ro
+RUN mkdir -p /app/weights
 
 CMD ["python", "-u", "app.py"]
