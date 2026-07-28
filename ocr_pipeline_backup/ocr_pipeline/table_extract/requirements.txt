@@ -1,3 +1,4 @@
+# Kafka / MinIO worker deps + core pdf_extractor runtime
 boto3
 botocore
 kafka-python-ng
@@ -7,3 +8,11 @@ numpy
 pypdfium2
 Pillow
 PyMuPDF
+pdfplumber
+python-docx
+lxml
+
+# Table backend (Paddle). Install CPU wheels by default; override in Dockerfile for GPU.
+paddlepaddle==3.2.2
+paddleocr>=3.0
+paddlex[ocr]>=3.0

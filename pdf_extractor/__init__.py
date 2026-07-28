@@ -2,31 +2,7 @@
 
 from __future__ import annotations
 
-# Keep package import light for workers (table_extract). Heavy optional modules
-# are imported lazily below / by callers.
-from .grid_table_extractor import detect_table_pages, extract_pdf_tables_to_excel
-from .ocr_cleanup import clean_ocr_errors
-from .pipeline import PDFPipeline
-from .router import PipelineChoice, classify_pdf, route_and_extract
-from .unified_pipeline import UnifiedPDFPipeline, UnifiedResult
-
-try:
-    from .docling_extractor import DoclingTableExtractor, extract_tables_from_pdf
-except ImportError:  # docling not installed yet
-    DoclingTableExtractor = None  # type: ignore[misc, assignment]
-    extract_tables_from_pdf = None  # type: ignore[misc, assignment]
-
-# Deprecated compatibility alias — do not import at module load (needs Pillow/torch).
-vlm_extractor = None  # type: ignore[misc, assignment]
-
-
-def __getattr__(name: str):
-    if name == "vlm_extractor":
-        from . import vlm_extractor as _vlm
-
-        return _vlm
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
+from typing import Any
 
 __all__ = [
     "PDFPipeline",
@@ -42,4 +18,43 @@ __all__ = [
     "route_and_extract",
     "PipelineChoice",
 ]
-__version__ = "6.8.1"
+__version__ = "6.8.2"
+
+
+def __getattr__(name: str) -> Any:
+    """Lazy exports so lightweight workers do not import heavy optional deps at import time."""
+    if name == "PDFPipeline":
+        from .pipeline import PDFPipeline
+
+        return PDFPipeline
+    if name == "UnifiedPDFPipeline":
+        from .unified_pipeline import UnifiedPDFPipeline
+
+        return UnifiedPDFPipeline
+    if name == "UnifiedResult":
+        from .unified_pipeline import UnifiedResult
+
+        return UnifiedResult
+    if name in {"extract_pdf_tables_to_excel", "detect_table_pages"}:
+        from . import grid_table_extractor as g
+
+        return getattr(g, name)
+    if name in {"DoclingTableExtractor", "extract_tables_from_pdf"}:
+        try:
+            from . import docling_extractor as d
+        except ImportError as exc:  # pragma: no cover
+            raise AttributeError(name) from exc
+        return getattr(d, name)
+    if name == "vlm_extractor":
+        from . import vlm_extractor as _vlm
+
+        return _vlm
+    if name == "clean_ocr_errors":
+        from .ocr_cleanup import clean_ocr_errors
+
+        return clean_ocr_errors
+    if name in {"classify_pdf", "route_and_extract", "PipelineChoice"}:
+        from . import router as r
+
+        return getattr(r, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
