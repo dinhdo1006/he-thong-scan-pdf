@@ -619,12 +619,12 @@ def assemble_document_blocks(
 def _merge_outline_continuation_blocks(parts: list[AssembledBlock]) -> list[AssembledBlock]:
     """
     Merge consecutive assembled table blocks that continue the same outline
-    form across a page break (e.g. page1 ends at 1.3.1, page2 starts at 1.3.2).
+    form across a page break.
 
-    Also force-merges B06/CD_02 tables even when short prose sits between them
-    (common with page-region assemble: footer of page 1 / header of page 2).
+    Also force-merges same-width outline tables even when short prose sits
+    between them (common with page-region assemble).
     """
-    from .table_layout import looks_like_b06_cd02_table, merge_b06_cd02_tables
+    from .table_layout import looks_like_outline_table, merge_outline_form_tables
 
     out: list[AssembledBlock] = []
     i = 0
@@ -645,35 +645,40 @@ def _merge_outline_continuation_blocks(parts: list[AssembledBlock]) -> list[Asse
         for df in stitch_outline_continuation_tables(run):
             out.append(AssembledBlock(kind="table", content=df))
 
-    # Second pass: B06 tables separated by prose → one table, prose kept after.
+    # Second pass: outline tables separated by prose → one table per width group.
     table_idxs = [
         idx
         for idx, b in enumerate(out)
         if b.kind == "table" and isinstance(b.content, pd.DataFrame)
     ]
-    b06_idxs = [
+    outline_idxs = [
         idx
         for idx in table_idxs
-        if looks_like_b06_cd02_table(out[idx].content)  # type: ignore[arg-type]
+        if looks_like_outline_table(out[idx].content)  # type: ignore[arg-type]
     ]
-    if len(b06_idxs) <= 1:
+    if len(outline_idxs) <= 1:
         return out
 
-    b06_tables = [out[idx].content for idx in b06_idxs]
-    assert all(isinstance(t, pd.DataFrame) for t in b06_tables)
-    merged_list = merge_b06_cd02_tables(b06_tables)  # type: ignore[arg-type]
-    if len(merged_list) != 1:
+    outline_tables = [out[idx].content for idx in outline_idxs]
+    assert all(isinstance(t, pd.DataFrame) for t in outline_tables)
+    merged_list = merge_outline_form_tables(outline_tables)  # type: ignore[arg-type]
+    if len(merged_list) >= len(outline_tables):
         return out
-    merged = merged_list[0]
 
+    # Rebuild: place merged tables in order, drop consumed outline fragments.
+    # merge_outline_form_tables returns a shorter list; map by consuming outline idxs.
     new_out: list[AssembledBlock] = []
-    first_b06 = b06_idxs[0]
-    b06_set = set(b06_idxs)
+    merge_iter = iter(merged_list)
+    outline_set = set(outline_idxs)
+    first_of_group = outline_idxs[0]
+    emitted = False
     for idx, block in enumerate(out):
-        if idx == first_b06:
-            new_out.append(AssembledBlock(kind="table", content=merged))
+        if idx == first_of_group and not emitted:
+            for merged in merge_iter:
+                new_out.append(AssembledBlock(kind="table", content=merged))
+            emitted = True
             continue
-        if idx in b06_set:
+        if idx in outline_set:
             continue
         new_out.append(block)
     return new_out
@@ -770,22 +775,16 @@ def export_tables_preview(
 
     # --- Excel (open with LibreOffice / Excel, not VS Code) ---
     try:
-        from .b06_excel import drop_semantic_helpers, is_b06_excel_candidate, write_b06_workbook
+        from .hierarchy_excel import drop_semantic_helpers, write_hierarchy_workbook
 
         export_tables = [drop_semantic_helpers(df) for df in tables] if tables else []
-        if export_tables and any(is_b06_excel_candidate(df) for df in tables):
-            # Writer also drops helpers; pass original so candidate detection still works,
-            # then helpers are stripped inside write_b06_workbook / flat path.
-            write_b06_workbook(tables, xlsx_path)
+        if export_tables:
+            write_hierarchy_workbook(tables, xlsx_path)
         else:
             with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
-                if not export_tables:
-                    pd.DataFrame({"info": [placeholder]}).to_excel(
-                        writer, sheet_name="No_Tables", index=False
-                    )
-                else:
-                    for idx, df in enumerate(export_tables, start=1):
-                        df.to_excel(writer, sheet_name=f"Table_{idx}"[:31], index=False)
+                pd.DataFrame({"info": [placeholder]}).to_excel(
+                    writer, sheet_name="No_Tables", index=False
+                )
     except Exception as exc:
         raise IOError(f"Failed to write Excel file '{xlsx_path}': {exc}") from exc
     written["xlsx"] = xlsx_path
@@ -796,7 +795,7 @@ def export_tables_preview(
 
     # --- CSV (one file per table; UTF-8 with BOM for Excel on Windows) ---
     if write_csv:
-        from .b06_excel import drop_semantic_helpers
+        from .hierarchy_excel import drop_semantic_helpers
 
         if not tables:
             csv_path = out_dir / f"{stem}_empty.csv"

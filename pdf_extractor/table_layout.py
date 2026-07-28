@@ -76,24 +76,10 @@ def is_outline_code(text: object) -> bool:
 
 _GROUP_HEADER_RE = re.compile(
     r"trong\s*đ[oó]|chấp\s*hành\s*viên|đã\s*giải\s*quyết|bao\s*gồm|"
-    r"trong\s*do|chap\s*hanh\s*vien",
+    r"trong\s*do|chap\s*hanh\s*vien|"
+    r"trong\s*đó|of\s+which|sub[- ]?total|chi\s*tiết",
     re.IGNORECASE,
 )
-
-# Official B06/CD_02 data columns (A B 1..7).
-# "Trong đó Chấp hành viên đã giải quyết..." is a GROUP title over cols 2–5,
-# not a data column of its own.
-_B06_CANONICAL_HEADERS = [
-    "Số TT A",
-    "Tiêu chí trong quyết định thi hành án B",
-    "Tổng số tiền, giá trị tài sản phải thi hành 1",
-    "Ủy thác THA 2",
-    "Trả đơn THA 3",
-    "Đình chỉ THA 4",
-    "Miễn, giảm THA 5",
-    "Số thực thu thi hành án 6",
-    "Số đã nộp Nhà nước và chi trả 7",
-]
 
 
 def is_group_header_label(text: object) -> bool:
@@ -101,7 +87,7 @@ def is_group_header_label(text: object) -> bool:
     s = _clean(text)
     if len(s) < 12:
         return False
-    return bool(_GROUP_HEADER_RE.search(s))
+    return bool(_GROUP_HEADER_RE.search(s)) or len(s) >= 28
 
 
 def is_generic_header(name: object) -> bool:
@@ -235,12 +221,11 @@ def left_compact_sparse_headers(df: pd.DataFrame) -> pd.DataFrame:
 
 def absorb_leading_header_rows(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Fold leading body rows that are still header labels / A-B-1-2 codes into
-    the column names so real data starts at the first outline/money row.
+    Fold leading body rows that are still header labels / column codes into a
+    multi-row ``header_matrix`` (stored on ``df.attrs``) and a flat column name
+    for pandas data access.
 
-    Label rows (Ủy thác / Trả đơn / ...) are packed into *empty* header slots
-    after left-compacting a sparse primary header — this recovers the common
-    multi-row form header without smashing labels onto STT/Tiêu chí.
+    Form-agnostic: works for any multi-row header, not a specific template.
     """
     if df is None or df.empty or len(df.columns) == 0:
         return df
@@ -260,85 +245,143 @@ def absorb_leading_header_rows(df: pd.DataFrame) -> pd.DataFrame:
             continue
         break
 
-    if not label_rows and not code_rows:
-        return df
-
-    headers = list(cols)
-
-    # Left-compact sparse primary headers before placing labels into empties.
-    if headers and not headers[0].strip() and not _headers_are_generic(headers):
-        non_empty = [c for c in headers if c.strip()]
+    width = len(cols)
+    primary = list(cols)
+    # Left-compact sparse primary for both matrix + flat names.
+    if primary and not primary[0].strip() and not _headers_are_generic(primary):
+        non_empty = [c for c in primary if c.strip()]
         if len(non_empty) >= 2:
-            headers = non_empty + [""] * (len(headers) - len(non_empty))
+            primary = non_empty + [""] * (width - len(non_empty))
 
+    if not label_rows and not code_rows:
+        out = df.copy()
+        if primary != list(cols):
+            out.columns = primary
+        out.attrs.update(getattr(df, "attrs", {}))
+        out.attrs["header_matrix"] = [_pad_row([_clean(c) for c in out.columns], len(out.columns))]
+        return out
+
+    matrix = [_pad_row(primary, width)]
+    # Align sub-header rows to the (possibly left-compacted) primary grid so
+    # labels don't smash onto filled primary cells when OCR shifted headers.
+    occupied = list(primary)
     for row in label_rows:
-        headers = _merge_header_label_row(headers, row)
-
+        placed = _align_subheader_row(occupied, row)
+        matrix.append(placed)
+        for i, cell in enumerate(placed):
+            if cell.strip() and not occupied[i].strip():
+                occupied[i] = cell
     for row in code_rows:
-        for i, cell in enumerate(row):
-            if i >= len(headers) or not cell.strip():
-                continue
-            code = cell.strip()
-            cur = headers[i].strip()
-            if not cur or is_generic_header(cur):
-                headers[i] = code
-            elif code not in cur.split():
-                headers[i] = f"{cur} {code}"
+        matrix.append(_pad_row(row, width))
 
-    headers = [
-        h if h.strip() else f"Column_{i + 1}" for i, h in enumerate(headers)
-    ]
+    flat = _flatten_header_matrix(matrix)
+    out = _df_from_matrix(flat, body)
+    out.attrs.update(getattr(df, "attrs", {}))
+    out.attrs["header_matrix"] = matrix
     logger.info(
-        "Absorbed %d label row(s) + %d column-code row(s) into headers.",
+        "Absorbed %d label row(s) + %d column-code row(s) into header_matrix (%d tiers).",
         len(label_rows),
         len(code_rows),
+        len(matrix),
     )
-    return _df_from_matrix(headers, body)
+    return out
+
+
+def _pad_row(row: Sequence[str], width: int) -> list[str]:
+    padded = [str(c) if c is not None else "" for c in row] + [""] * max(0, width - len(row))
+    return padded[:width]
+
+
+def _slot_open_for_subheader(cur: str) -> bool:
+    text = cur.strip()
+    return (not text) or is_generic_header(text) or is_group_header_label(text)
+
+
+def _align_subheader_row(base: Sequence[str], subrow: Sequence[str]) -> list[str]:
+    """
+    Place a sub-header / label row onto the primary column grid.
+
+    Prefer same-index placement when those slots are open (empty / generic /
+    group title). Otherwise pack labels into remaining open slots so they do
+    not concatenate onto already-filled primary headers (e.g. ``so TT``).
+    """
+    width = len(base)
+    row = _pad_row(subrow, width)
+    non_empty_idxs = [i for i, c in enumerate(row) if str(c).strip()]
+    if not non_empty_idxs:
+        return [""] * width
+
+    positional_hits = sum(1 for i in non_empty_idxs if _slot_open_for_subheader(base[i]))
+    use_positional = positional_hits / len(non_empty_idxs) >= 0.5
+
+    placed = [""] * width
+    if use_positional:
+        for i in non_empty_idxs:
+            cell = row[i].strip()
+            if _slot_open_for_subheader(base[i]):
+                placed[i] = cell
+            else:
+                # Collision: try next open slot to the right, else pack later.
+                for j in range(i + 1, width):
+                    if not placed[j] and _slot_open_for_subheader(base[j]):
+                        placed[j] = cell
+                        break
+        return placed
+
+    label_tokens = [row[i].strip() for i in non_empty_idxs]
+    empty_idxs = [i for i in range(width) if _slot_open_for_subheader(base[i])]
+    for token, idx in zip(label_tokens, empty_idxs):
+        placed[idx] = token
+    return placed
+
+
+def _flatten_header_matrix(matrix: list[list[str]]) -> list[str]:
+    """Build one pandas column name per grid column from multi-row headers."""
+    if not matrix:
+        return []
+    width = max(len(r) for r in matrix)
+    flat: list[str] = []
+    for i in range(width):
+        parts: list[str] = []
+        code = ""
+        for row in matrix:
+            cell = row[i].strip() if i < len(row) else ""
+            if not cell:
+                continue
+            if _COLUMN_CODE_RE.fullmatch(cell):
+                code = cell
+                continue
+            if cell not in parts:
+                parts.append(cell)
+        # Prefer concrete sub-label over a spanning group title.
+        if len(parts) >= 2 and is_group_header_label(parts[0]):
+            parts = [p for p in parts[1:] if p] or parts[-1:]
+        name = " ".join(parts).strip()
+        if code and code not in name.split():
+            name = f"{name} {code}".strip() if name else code
+        flat.append(name if name else f"Column_{i + 1}")
+    return flat
 
 
 def _merge_header_label_row(headers: list[str], label_row: list[str]) -> list[str]:
     """
-    Merge one sub-header label row into ``headers``.
-
-    Prefer *positional* placement (label cell i → header i) so Ủy thác stays
-    under column 2. Fall back to packing into empty/group slots when the OCR
-    row is left-clustered while empties sit further right.
+    Legacy helper kept for tests: merge one sub-header label row into flat headers.
+    Prefer positional placement; fall back to packing into open slots.
     """
     out = list(headers)
     width = len(out)
-    row = list(label_row) + [""] * max(0, width - len(label_row))
-    row = row[:width]
-
-    non_empty_idxs = [i for i, c in enumerate(row) if c.strip()]
-    if not non_empty_idxs:
-        return out
-
-    def _slot_open(i: int) -> bool:
+    placed = _align_subheader_row(out, label_row)
+    for i, cell in enumerate(placed):
+        if not cell.strip():
+            continue
         cur = out[i].strip()
-        return (not cur) or is_generic_header(cur) or is_group_header_label(cur)
-
-    positional_hits = sum(1 for i in non_empty_idxs if _slot_open(i))
-    use_positional = positional_hits / len(non_empty_idxs) >= 0.5
-
-    if use_positional:
-        for i in non_empty_idxs:
-            cell = row[i].strip()
-            cur = out[i].strip()
-            if not cur or is_generic_header(cur) or is_group_header_label(cur):
+        if not cur or is_generic_header(cur) or is_group_header_label(cur):
+            out[i] = cell
+        elif cell not in cur:
+            if is_group_header_label(cur) and not is_group_header_label(cell):
                 out[i] = cell
-            elif cell not in cur:
-                # Prefer concrete sub-label over keeping only the group title.
-                if is_group_header_label(cur) and not is_group_header_label(cell):
-                    out[i] = cell
-                else:
-                    out[i] = f"{cur} {cell}"
-        return out
-
-    # Fallback: pack non-empty tokens into open slots (legacy sparse headers).
-    label_tokens = [row[i].strip() for i in non_empty_idxs]
-    empty_idxs = [i for i in range(width) if _slot_open(i)]
-    for token, idx in zip(label_tokens, empty_idxs):
-        out[idx] = token
+            else:
+                out[i] = f"{cur} {cell}"
     return out
 
 
@@ -458,46 +501,16 @@ def drop_empty_spacer_rows(df: pd.DataFrame) -> pd.DataFrame:
     return _df_from_matrix(cols, kept)
 
 
-def looks_like_b06_cd02_table(df: pd.DataFrame) -> bool:
-    """
-    Heuristic for the B06/CD_02 9-column enforcement form.
-
-    We only need a coarse detector: width 9 plus strong header/body hints.
-    """
-    if df is None or len(getattr(df, "columns", [])) != 9:
+def looks_like_outline_table(df: pd.DataFrame) -> bool:
+    """True when enough leading cells look like outline STT codes (any form)."""
+    if df is None or len(getattr(df, "columns", [])) < 2:
         return False
-
-    cols, body = _matrix_from_df(df)
-    haystack = " | ".join(cols + [cell for row in body[:6] for cell in row]).lower()
-    hits = 0
-    if "số tt" in haystack or "so tt" in haystack:
-        hits += 1
-    if "tiêu chí" in haystack or "tieu chi" in haystack:
-        hits += 1
-    if "ủy thác" in haystack or "uy thac" in haystack:
-        hits += 1
-    if "trả đơn" in haystack or "tra don" in haystack:
-        hits += 1
-    if "đình chỉ" in haystack or "dinh chi" in haystack:
-        hits += 1
-    if "miễn" in haystack or "mien" in haystack:
-        hits += 1
-
-    # Also allow strong structural cues even if OCR text is noisy.
-    first_col_hits = sum(1 for row in body[:8] if row and is_outline_code(row[0]))
-    return hits >= 3 or first_col_hits >= 3
-
-
-def canonicalize_b06_cd02_headers(df: pd.DataFrame) -> pd.DataFrame:
-    """Force the known B06/CD_02 9-column header order when detected."""
-    if not looks_like_b06_cd02_table(df):
-        return df
-    if list(df.columns) == _B06_CANONICAL_HEADERS:
-        return df
-    out = df.copy()
-    out.columns = _B06_CANONICAL_HEADERS
-    logger.info("Canonicalized B06/CD_02 headers to the standard 9-column schema.")
-    return out
+    _, body = _matrix_from_df(df)
+    if not body:
+        return False
+    sample = body[:20]
+    hits = sum(1 for row in sample if row and is_outline_code(row[0]))
+    return hits >= 2
 
 
 def _stt_cell(row: Sequence[object], stt_idx: int = 0) -> str:
@@ -506,80 +519,88 @@ def _stt_cell(row: Sequence[object], stt_idx: int = 0) -> str:
     return normalize_outline_token(row[stt_idx])
 
 
-def merge_b06_cd02_tables(tables: list[pd.DataFrame]) -> list[pd.DataFrame]:
+def merge_outline_form_tables(tables: list[pd.DataFrame]) -> list[pd.DataFrame]:
     """
-    Force-merge all detected B06/CD_02 tables into one grid.
+    Merge same-width outline-form tables into one grid (page-split forms).
 
-    Page-region assemble often inserts prose between page-1 and page-2 tables,
-    which blocks consecutive-table stitching. Deduplicate by STT, keeping the
-    richer row when the same code appears twice.
+    Deduplicate by STT, keep the richer row, preserve the first table's
+    columns + ``header_matrix``. Form-agnostic — no template schema.
     """
     if len(tables) <= 1:
         return tables
 
-    b06_idxs = [i for i, df in enumerate(tables) if looks_like_b06_cd02_table(df)]
-    if len(b06_idxs) <= 1:
+    outline_idxs = [i for i, df in enumerate(tables) if looks_like_outline_table(df)]
+    if len(outline_idxs) <= 1:
         return tables
 
-    repaired = [canonicalize_b06_cd02_headers(repair_form_table(tables[i])) for i in b06_idxs]
-    width = len(_B06_CANONICAL_HEADERS)
-    by_stt: dict[str, list[str]] = {}
-    order: list[str] = []
-    extras: list[list[str]] = []  # rows without outline codes (footer notes)
+    # Group by width so unrelated tables stay separate.
+    by_width: dict[int, list[int]] = {}
+    for i in outline_idxs:
+        by_width.setdefault(len(tables[i].columns), []).append(i)
 
-    def _richer(a: list[str], b: list[str]) -> list[str]:
-        score_a = sum(1 for c in a if c.strip())
-        score_b = sum(1 for c in b if c.strip())
-        if score_b > score_a:
-            # Prefer non-empty cells from the richer row, fill gaps from the other.
-            out = list(b)
-            for i, cell in enumerate(a):
-                if i < len(out) and not out[i].strip() and cell.strip():
-                    out[i] = cell
-            return out
-        out = list(a)
-        for i, cell in enumerate(b):
-            if i < len(out) and not out[i].strip() and cell.strip():
-                out[i] = cell
-        return out
+    replacements: dict[int, pd.DataFrame] = {}
+    consumed: set[int] = set()
+    for width, idxs in by_width.items():
+        if len(idxs) <= 1:
+            continue
+        repaired = [repair_form_table(tables[i]) for i in idxs]
+        headers = list(repaired[0].columns)
+        header_matrix = getattr(repaired[0], "attrs", {}).get("header_matrix")
+        by_stt: dict[str, list[str]] = {}
+        order: list[str] = []
+        extras: list[list[str]] = []
 
-    for df in repaired:
-        _, body = _matrix_from_df(df)
-        for row in body:
-            padded = list(row) + [""] * max(0, width - len(row))
-            padded = padded[:width]
-            code = _stt_cell(padded, 0)
-            if is_outline_code(code):
-                if code not in by_stt:
-                    by_stt[code] = padded
-                    order.append(code)
-                else:
-                    by_stt[code] = _richer(by_stt[code], padded)
-            elif any(c.strip() for c in padded):
-                extras.append(padded)
+        def _richer(a: list[str], b: list[str]) -> list[str]:
+            score_a = sum(1 for c in a if c.strip())
+            score_b = sum(1 for c in b if c.strip())
+            base = list(b if score_b > score_a else a)
+            other = a if score_b > score_a else b
+            for i, cell in enumerate(other):
+                if i < len(base) and not base[i].strip() and cell.strip():
+                    base[i] = cell
+            return base
 
-    merged_body = [by_stt[c] for c in order] + extras
-    merged = _df_from_matrix(list(_B06_CANONICAL_HEADERS), merged_body)
-    # Preserve attrs from the first B06 table.
-    merged.attrs.update(getattr(tables[b06_idxs[0]], "attrs", {}))
-    logger.info(
-        "Merged %d B06/CD_02 tables into 1 (%d unique STT rows).",
-        len(b06_idxs),
-        len(order),
-    )
+        for df in repaired:
+            _, body = _matrix_from_df(df)
+            for row in body:
+                padded = _pad_row(row, width)
+                code = _stt_cell(padded, 0)
+                if is_outline_code(code):
+                    if code not in by_stt:
+                        by_stt[code] = padded
+                        order.append(code)
+                    else:
+                        by_stt[code] = _richer(by_stt[code], padded)
+                elif any(c.strip() for c in padded):
+                    extras.append(padded)
+
+        merged_body = [by_stt[c] for c in order] + extras
+        merged = _df_from_matrix(headers, merged_body)
+        merged.attrs.update(getattr(tables[idxs[0]], "attrs", {}))
+        if header_matrix:
+            merged.attrs["header_matrix"] = header_matrix
+        logger.info(
+            "Merged %d outline tables (width=%d) into 1 (%d unique STT rows).",
+            len(idxs),
+            width,
+            len(order),
+        )
+        replacements[idxs[0]] = merged
+        consumed.update(idxs)
+
+    if not consumed:
+        return tables
 
     out: list[pd.DataFrame] = []
-    consumed = set(b06_idxs)
-    placed = False
+    placed: set[int] = set()
     for i, df in enumerate(tables):
+        if i in replacements:
+            out.append(replacements[i])
+            placed.add(i)
+            continue
         if i in consumed:
-            if not placed:
-                out.append(merged)
-                placed = True
             continue
         out.append(df)
-    if not placed:
-        out.append(merged)
     return out
 
 
@@ -588,13 +609,14 @@ def repair_form_table(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or len(df.columns) == 0:
         return df
     out = demote_false_data_headers(df)
-    # absorb left-compacts when label rows exist; left_compact is a no-op
-    # afterward if col0 is already filled.
     out = absorb_leading_header_rows(out)
     out = left_compact_sparse_headers(out)
+    # Keep header_matrix if left_compact only changed flat names.
+    matrix = getattr(out, "attrs", {}).get("header_matrix")
     out = realign_shifted_outline_rows(out)
     out = drop_empty_spacer_rows(out)
-    out = canonicalize_b06_cd02_headers(out)
+    if matrix and "header_matrix" not in getattr(out, "attrs", {}):
+        out.attrs["header_matrix"] = matrix
     return out
 
 
@@ -686,17 +708,19 @@ def concat_continuation_tables(prev: pd.DataFrame, nxt: pd.DataFrame) -> pd.Data
         aligned_rows.append(padded[:width])
 
     cont = pd.DataFrame(aligned_rows, columns=list(left.columns))
-    return pd.concat([left, cont], ignore_index=True)
+    out = pd.concat([left, cont], ignore_index=True)
+    out.attrs.update(getattr(left, "attrs", {}))
+    return out
 
 
 def stitch_outline_continuation_tables(tables: list[pd.DataFrame]) -> list[pd.DataFrame]:
     """
     Merge consecutive tables that look like multi-page outline-form continuations.
     Safe no-op when widths differ or outline order goes backwards.
-    Always force-merge B06/CD_02 fragments into one table when detected.
+    Also merges same-width outline fragments that share STT density/order.
     """
     if len(tables) <= 1:
-        return merge_b06_cd02_tables(tables)
+        return merge_outline_form_tables(tables)
 
     stitched: list[pd.DataFrame] = [repair_form_table(tables[0])]
     for nxt in tables[1:]:
@@ -712,4 +736,4 @@ def stitch_outline_continuation_tables(tables: list[pd.DataFrame]) -> list[pd.Da
             )
         else:
             stitched.append(nxt_fixed)
-    return merge_b06_cd02_tables(stitched)
+    return merge_outline_form_tables(stitched)
