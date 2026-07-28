@@ -34,6 +34,7 @@ def init_s3():
 
 
 def run_extract(pdf_path: Path, work_dir: Path):
+    # Import submodules directly to avoid optional heavy deps at package root.
     from pdf_extractor.pipeline_bridge import write_structured_tables_json
     from pdf_extractor.unified_pipeline import UnifiedPDFPipeline
 

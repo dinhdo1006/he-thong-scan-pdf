@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from . import vlm_extractor  # noqa: F401 — deprecated; kept for import-path compatibility
+# Keep package import light for workers (table_extract). Heavy optional modules
+# are imported lazily below / by callers.
 from .grid_table_extractor import detect_table_pages, extract_pdf_tables_to_excel
 from .ocr_cleanup import clean_ocr_errors
 from .pipeline import PDFPipeline
@@ -14,6 +15,18 @@ try:
 except ImportError:  # docling not installed yet
     DoclingTableExtractor = None  # type: ignore[misc, assignment]
     extract_tables_from_pdf = None  # type: ignore[misc, assignment]
+
+# Deprecated compatibility alias — do not import at module load (needs Pillow/torch).
+vlm_extractor = None  # type: ignore[misc, assignment]
+
+
+def __getattr__(name: str):
+    if name == "vlm_extractor":
+        from . import vlm_extractor as _vlm
+
+        return _vlm
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     "PDFPipeline",
@@ -29,4 +42,4 @@ __all__ = [
     "route_and_extract",
     "PipelineChoice",
 ]
-__version__ = "6.8.0"
+__version__ = "6.8.1"

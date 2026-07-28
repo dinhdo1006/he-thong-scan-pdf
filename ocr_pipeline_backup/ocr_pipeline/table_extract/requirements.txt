@@ -5,3 +5,5 @@ pandas
 openpyxl
 numpy
 pypdfium2
+Pillow
+PyMuPDF
