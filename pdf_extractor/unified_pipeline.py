@@ -130,6 +130,7 @@ class UnifiedResult:
     docx_path: Optional[Path] = None
     xlsx_path: Optional[Path] = None
     txt_path: Optional[Path] = None
+    tables: List[pd.DataFrame] = field(default_factory=list)
 
 
 def _needs_process_isolation() -> bool:
@@ -818,6 +819,7 @@ class UnifiedPDFPipeline:
             docx_path=written_docx,
             xlsx_path=written_xlsx,
             txt_path=written_txt,
+            tables=list(final_tables),
         )
 
 

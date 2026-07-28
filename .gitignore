@@ -77,3 +77,8 @@ secrets.json
 tmp/
 temp/
 .tmp/
+
+# --- OCR pipeline local data / smoke ---
+ocr_pipeline_backup/ocr_pipeline/home/
+smoke_docx_out/
+ocr_pipeline_backup/ocr_pipeline/vietocr/weights/

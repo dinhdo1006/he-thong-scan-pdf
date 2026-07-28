@@ -1,0 +1,7 @@
+paddlepaddle==2.6.2
+paddleocr==2.7.3
+opencv-python-headless
+numpy<2.0.0
+boto3
+kafka-python==2.0.2
+requests

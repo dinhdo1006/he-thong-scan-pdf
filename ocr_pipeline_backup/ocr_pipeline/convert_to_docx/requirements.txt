@@ -1,0 +1,4 @@
+boto3
+botocore
+kafka-python-ng
+python-docx==1.1.0
